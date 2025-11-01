@@ -1,41 +1,216 @@
 #!/bin/bash
 
-# Path to the sessions file
-SESSIONS_FILE="$HOME/.sshmx/sessions.json"
+# sshmx - Enhanced SSH Session Manager
+# Version: 2.0
 
-# Log file for parsing (moved to .sshmx for consistency)
-LOG_FILE="$HOME/.sshmx/sshmx.log"
+set -euo pipefail
 
-# Script name for self-reference
-SCRIPT_NAME="sshmx"
-SCRIPT_PATH="$(realpath "$0")"
+# ============================================================================
+# CONSTANTS & CONFIGURATION
+# ============================================================================
 
-mkdir -p "$HOME/.sshmx"
+readonly SSHMX_DIR="$HOME/.sshmx"
+readonly SESSIONS_FILE="$SSHMX_DIR/sessions.json"
+readonly TEMPLATES_FILE="$SSHMX_DIR/templates.json"
+readonly HISTORY_FILE="$SSHMX_DIR/history.json"
+readonly BACKUP_DIR="$SSHMX_DIR/backups"
+readonly LOG_FILE="$SSHMX_DIR/sshmx.log"
+readonly LOCK_FILE="$SSHMX_DIR/.sessions.lock"
+readonly MAP_FILE="$SSHMX_DIR/sshmx-mapping"
+readonly TMUX_KEYBINDINGS_FILE="$SSHMX_DIR/tmux-keybindings.conf"
 
-# Ensure GPG_TTY is set for pinentry
-if tty >/dev/null 2>&1; then
-    export GPG_TTY=$(tty)
-else
-    echo "Warning: No TTY available (non-interactive shell?). GPG may prompt incorrectly or fail."
-    echo "Tip: Run in an interactive terminal or set GPG_TTY manually."
-fi
+readonly SCRIPT_NAME="sshmx"
+readonly SCRIPT_PATH="$(realpath "$0")"
+readonly DEFAULT_SESSION="sshmx"
+readonly SYNC_WINDOW="sync-input"
 
-# Function to install script to PATH and tmux.conf
-install_script() {
-    local bin_dir="$HOME/.local/bin"
-    mkdir -p "$bin_dir"
+# Create directory structure
+mkdir -p "$SSHMX_DIR" "$BACKUP_DIR"
 
-    if [[ ! -L "$bin_dir/$SCRIPT_NAME" ]]; then
-        ln -sf "$SCRIPT_PATH" "$bin_dir/$SCRIPT_NAME"
-        echo "Symlink created: $bin_dir/$SCRIPT_NAME -> $SCRIPT_PATH"
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+log() {
+    echo "$(date '+%F %T') [$1] $2" >> "$LOG_FILE"
+}
+
+error() {
+    echo "Error: $1" >&2
+    log "ERROR" "$1"
+    return 1
+}
+
+warn() {
+    echo "Warning: $1" >&2
+    log "WARN" "$1"
+}
+
+info() {
+    echo "$1"
+    log "INFO" "$1"
+}
+
+# Ensure GPG_TTY is set
+setup_gpg_tty() {
+    if tty >/dev/null 2>&1; then
+        export GPG_TTY=$(tty)
     else
-        echo "Symlink already exists: $bin_dir/$SCRIPT_NAME"
+        warn "No TTY available. GPG may prompt incorrectly."
     fi
+}
 
+# Check dependencies
+check_dependencies() {
+    local missing=()
+    local optional_missing=()
+    
+    for cmd in jq fzf tmux gpg; do
+        if ! command -v "$cmd" &> /dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    
+    for cmd in sshpass ct getent nc; do
+        if ! command -v "$cmd" &> /dev/null; then
+            optional_missing+=("$cmd")
+        fi
+    done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        error "Required dependencies missing: ${missing[*]}"
+        return 1
+    fi
+    
+    if [[ ${#optional_missing[@]} -gt 0 ]]; then
+        warn "Optional dependencies missing: ${optional_missing[*]}"
+    fi
+    
+    return 0
+}
+
+# File locking for concurrent access protection
+acquire_lock() {
+    local timeout="${1:-10}"
+    local elapsed=0
+    
+    while [[ $elapsed -lt $timeout ]]; do
+        if mkdir "$LOCK_FILE" 2>/dev/null; then
+            trap 'release_lock' EXIT INT TERM
+            return 0
+        fi
+        sleep 1
+        ((elapsed++))
+    done
+    
+    error "Could not acquire lock after ${timeout}s"
+    return 1
+}
+
+release_lock() {
+    rmdir "$LOCK_FILE" 2>/dev/null || true
+}
+
+# Safe atomic file operations
+atomic_write() {
+    local target_file="$1"
+    local tmp_file
+    tmp_file=$(mktemp "${target_file}.XXXXXX") || return 1
+    chmod 600 "$tmp_file"
+    
+    cat > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    
+    mv "$tmp_file" "$target_file" || { rm -f "$tmp_file"; return 1; }
+}
+
+# Safe jq operations with error handling
+safe_jq() {
+    local output
+    if ! output=$(jq "$@" 2>&1); then
+        error "jq operation failed: $output"
+        return 1
+    fi
+    echo "$output"
+}
+
+# Validate JSON structure
+validate_sessions_json() {
+    if [[ ! -f "$SESSIONS_FILE" ]]; then
+        echo '{}' | atomic_write "$SESSIONS_FILE"
+        return 0
+    fi
+    
+    if ! jq empty "$SESSIONS_FILE" 2>/dev/null; then
+        warn "Corrupted sessions.json detected. Creating backup."
+        cp "$SESSIONS_FILE" "$SESSIONS_FILE.corrupted-$(date +%s)"
+        echo '{}' | atomic_write "$SESSIONS_FILE"
+    fi
+}
+
+# Initialize data files
+initialize_data_files() {
+    validate_sessions_json
+    
+    [[ -f "$TEMPLATES_FILE" ]] || echo '{}' | atomic_write "$TEMPLATES_FILE"
+    [[ -f "$HISTORY_FILE" ]] || echo '{"connections": [], "favorites": []}' | atomic_write "$HISTORY_FILE"
+}
+
+# ============================================================================
+# TMUX KEYBINDINGS MANAGEMENT
+# ============================================================================
+
+create_tmux_keybindings() {
+    cat > "$TMUX_KEYBINDINGS_FILE" << 'EOF'
+# sshmx temporary keybindings - auto-generated
+bind-key -n C-M-s display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx"
+bind-key -n C-M-g display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx --groups"
+bind-key -n C-M-m display-popup -E -w 90% -h 80% -d "#{pane_current_path}" "sshmx --multiplex"
+bind-key -n C-M-d run-shell "sshmx --demultiplex"
+bind-key -n C-M-h display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx --history"
+bind-key -n C-M-t display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx --templates"
+bind-key -n C-M-c run-shell "sshmx --check-all"
+EOF
+    log "INFO" "Created temporary tmux keybindings file"
+}
+
+load_tmux_keybindings() {
+    if [[ -n "${TMUX:-}" ]]; then
+        create_tmux_keybindings
+        tmux source-file "$TMUX_KEYBINDINGS_FILE" 2>/dev/null || warn "Could not load tmux keybindings"
+        info "Loaded temporary tmux keybindings (active only while sshmx is running)"
+        info "  Ctrl+Alt+s: Select sessions"
+        info "  Ctrl+Alt+g: Select groups"
+        info "  Ctrl+Alt+m: Multiplex windows"
+        info "  Ctrl+Alt+d: Demultiplex"
+        info "  Ctrl+Alt+h: Connection history"
+        info "  Ctrl+Alt+t: Templates"
+        info "  Ctrl+Alt+c: Health check all"
+    fi
+}
+
+unload_tmux_keybindings() {
+    if [[ -n "${TMUX:-}" ]] && [[ -f "$TMUX_KEYBINDINGS_FILE" ]]; then
+        # Unbind all keys
+        tmux unbind-key -n C-M-s 2>/dev/null || true
+        tmux unbind-key -n C-M-g 2>/dev/null || true
+        tmux unbind-key -n C-M-m 2>/dev/null || true
+        tmux unbind-key -n C-M-d 2>/dev/null || true
+        tmux unbind-key -n C-M-h 2>/dev/null || true
+        tmux unbind-key -n C-M-t 2>/dev/null || true
+        tmux unbind-key -n C-M-c 2>/dev/null || true
+        rm -f "$TMUX_KEYBINDINGS_FILE"
+        log "INFO" "Unloaded temporary tmux keybindings"
+    fi
+}
+
+# ============================================================================
+# INSTALLATION
+# ============================================================================
+
+setup_permanent_tmux_config() {
     local tmux_configs=(
-        "$HOME/.tmux.conf"
-        "$HOME/.config/tmux.conf"
         "$HOME/.config/tmux/tmux.conf"
+        "$HOME/.tmux.conf"
     )
 
     local tmux_conf=""
@@ -47,117 +222,197 @@ install_script() {
     done
 
     if [[ -z "$tmux_conf" ]]; then
-        tmux_conf="$HOME/.tmux.conf"
+        tmux_conf="${tmux_configs[0]}"
         mkdir -p "$(dirname "$tmux_conf")"
         touch "$tmux_conf"
-        echo "Created new tmux.conf at $tmux_conf"
+        info "Created tmux.conf at $tmux_conf"
     fi
 
-    if ! grep -q "bind-key C-s display-popup.*sshmx" "$tmux_conf" 2>/dev/null; then
-        echo 'bind-key C-s display-popup -E -w 70% -d "#{pane_current_path}" "sshmx"' >> "$tmux_conf"
-        echo "Tmux binding added to $tmux_conf. Reload with 'tmux source-file $tmux_conf' or restart tmux."
+    # Keybindings to add (using Ctrl+b prefix + key)
+    local bindings=(
+        'bind-key S display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx"'
+        'bind-key G display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx --groups"'
+        'bind-key M display-popup -E -w 90% -h 80% -d "#{pane_current_path}" "sshmx --multiplex"'
+        'bind-key D run-shell "sshmx --demultiplex"'
+        'bind-key H display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx --history"'
+    )
+
+    local added=0
+    for binding in "${bindings[@]}"; do
+        if ! grep -qF "$binding" "$tmux_conf" 2>/dev/null; then
+            echo "$binding" >> "$tmux_conf"
+            ((added++))
+        fi
+    done
+
+    if [[ $added -gt 0 ]]; then
+        info "Added $added tmux binding(s) to $tmux_conf"
+        info "Use: prefix+S (sessions), prefix+G (groups), prefix+M (multiplex), prefix+D (demux), prefix+H (history)"
     else
-        echo "Tmux binding already exists in $tmux_conf."
+        info "All tmux bindings already exist in $tmux_conf"
     fi
-    if ! grep -q "bind-key C-g display-popup.*sshmx.*-g" "$tmux_conf" 2>/dev/null; then
-        echo 'bind-key C-g display-popup -E -w 70% -d "#{pane_current_path}" "sshmx -g"' >> "$tmux_conf"
-        echo "Tmux groups binding added to $tmux_conf. Reload with 'tmux source-file $tmux_conf' or restart tmux."
+}
+
+install_script() {
+    local bin_dir="$HOME/.local/bin"
+    mkdir -p "$bin_dir"
+
+    # Create symlink
+    if [[ ! -L "$bin_dir/$SCRIPT_NAME" ]]; then
+        ln -sf "$SCRIPT_PATH" "$bin_dir/$SCRIPT_NAME"
+        chmod +x "$SCRIPT_PATH"
+        info "Symlink created: $bin_dir/$SCRIPT_NAME -> $SCRIPT_PATH"
     else
-        echo "Tmux groups binding already exists in $tmux_conf."
-    fi
-    if ! grep -q "bind-key C-q run-shell 'bash sshmx -d'" "$tmux_conf" 2>/dev/null; then
-        echo "bind-key C-q run-shell 'bash sshmx -d'" >> "$tmux_conf"
-        echo "Tmux demultiplex binding added to $tmux_conf."
-    else
-        echo "Tmux demultiplex binding already exists in $tmux_conf."
-    fi
-    if ! grep -q "bind-key C-m display-popup.*sshmx -m" "$tmux_conf" 2>/dev/null; then
-        echo 'bind-key C-m display-popup -E -w 90% -h 80% -d "#{pane_current_path}" "sshmx -m"' >> "$tmux_conf"
-        echo "Tmux multiplex binding added to $tmux_conf."
-    else
-        echo "Tmux multiplex binding already exists in $tmux_conf."
+        info "Symlink already exists: $bin_dir/$SCRIPT_NAME"
     fi
 
-    if ! grep -q "export PATH=\"\$HOME/.local/bin:" "$HOME/.bashrc" 2>/dev/null; then
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
-        echo "Added $bin_dir to PATH in ~/.bashrc. Run 'source ~/.bashrc' to apply."
-    else
-        echo "$bin_dir already in PATH in ~/.bashrc."
-    fi
+    # Setup PATH in shell rc files
+    local shell_rcs=("$HOME/.bashrc" "$HOME/.zshrc")
+    local path_line='export PATH="$HOME/.local/bin:$PATH"'
+    
+    for shell_rc in "${shell_rcs[@]}"; do
+        if [[ -f "$shell_rc" ]]; then
+            if ! grep -qF "$path_line" "$shell_rc" 2>/dev/null; then
+                echo "" >> "$shell_rc"
+                echo "# sshmx PATH" >> "$shell_rc"
+                echo "$path_line" >> "$shell_rc"
+                info "Added $bin_dir to PATH in $shell_rc"
+            fi
+        fi
+    done
 
-    if ! grep -q "_sshmx() {" "$HOME/.bashrc" 2>/dev/null; then
+    # Add bash completion
+    if [[ -f "$HOME/.bashrc" ]] && ! grep -q "^complete -F _sshmx sshmx" "$HOME/.bashrc" 2>/dev/null; then
         cat >> "$HOME/.bashrc" << 'EOF'
 
+# sshmx bash completion
 _sshmx() {
     local cur prev opts
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    opts="--install --add --edit --remove --sync --groups --export --import --help -i -a -e -r -s -g -e -p -h"
+    opts="--install --add --edit --remove --sync --groups --export --import --multiplex --demultiplex --history --templates --check --health --favorites --bulk-edit --help"
 
     if [[ ${cur} == -* ]] ; then
         COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
         return 0
     fi
 }
-
 complete -F _sshmx sshmx
 EOF
-        echo "Bash completion added to ~/.bashrc. Run 'source ~/.bashrc' to apply."
-    else
-        echo "Bash completion already exists in ~/.bashrc."
+        info "Bash completion added to ~/.bashrc"
     fi
 
-    echo "Installation complete. Run 'source ~/.bashrc' and reload tmux. For GPG password encryption, configure ~/.gnupg/gpg-agent.conf (e.g., 'default-cache-ttl 3600')."
+    # Setup tmux configuration
+    setup_permanent_tmux_config
+
+    # Create initial sessions file
+    initialize_data_files
+
+    echo ""
+    info "============================================"
+    info "Installation complete!"
+    info "============================================"
+    info "Next steps:"
+    info "  1. Run: source ~/.bashrc (or ~/.zshrc)"
+    info "  2. In tmux, run: tmux source-file ~/.tmux.conf"
+    info "  3. Configure GPG agent: ~/.gnupg/gpg-agent.conf"
+    info "     Add: default-cache-ttl 3600"
+    info ""
+    info "Permanent keybindings (prefix = Ctrl+b):"
+    info "  prefix+S: Select sessions"
+    info "  prefix+G: Select groups"
+    info "  prefix+M: Multiplex windows"
+    info "  prefix+D: Demultiplex"
+    info "  prefix+H: Connection history"
+    info ""
+    info "When running sshmx, temporary Ctrl+Alt+key bindings are also available"
+    info "============================================"
 }
 
-# Function to add new session interactively
+# ============================================================================
+# PASSWORD ENCRYPTION/DECRYPTION
+# ============================================================================
+
+encrypt_password() {
+    local password="$1"
+    local encrypted
+    
+    if [[ -z "$password" ]]; then
+        echo ""
+        return 0
+    fi
+    
+    if ! encrypted=$(echo -n "$password" | gpg --symmetric --armor --trust-model always 2>/dev/null | base64 -w0); then
+        error "GPG encryption failed. Ensure gpg-agent is running and GPG_TTY is set."
+        return 1
+    fi
+    
+    echo "$encrypted"
+}
+
+decrypt_password() {
+    local enc_pw="$1"
+    local decrypted
+    
+    if [[ -z "$enc_pw" ]]; then
+        echo ""
+        return 0
+    fi
+    
+    if ! decrypted=$(echo "$enc_pw" | base64 -d | gpg --decrypt --quiet 2>/dev/null); then
+        error "GPG decryption failed. Check gpg-agent and GPG_TTY."
+        return 1
+    fi
+    
+    echo "$decrypted"
+}
+
+# ============================================================================
+# SESSION MANAGEMENT
+# ============================================================================
+
 add_session() {
-    echo "Adding new SSH session. Follow prompts (Ctrl+C to cancel)."
+    info "Adding new SSH session (Ctrl+C to cancel)"
+    
     read -p "Session name: " name
-    if [[ -z "$name" ]]; then
-        echo "Session name cannot be empty."
-        return 1
-    fi
+    [[ -z "$name" ]] && error "Session name cannot be empty" && return 1
+    
     if jq -e --arg n "$name" 'has($n)' "$SESSIONS_FILE" > /dev/null 2>&1; then
-        echo "Warning: Session '$name' exists. Overwriting."
+        read -p "Session '$name' exists. Overwrite? (y/n): " confirm
+        [[ "$confirm" != "y" ]] && info "Cancelled" && return 0
     fi
 
-    read -p "Host/IP (hostname preferred, resolved at connect): " host
-    if [[ -z "$host" ]]; then
-        echo "Host cannot be empty."
-        return 1
-    fi
+    read -p "Host/IP: " host
+    [[ -z "$host" ]] && error "Host cannot be empty" && return 1
 
-    read -p "User (default $USER): " user
+    read -p "User (default: $USER): " user
     user=${user:-$USER}
 
-    read -p "Port (default 22): " port
-    if [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]]; then
-        echo "Invalid port, using default 22."
-        port=22
-    fi
+    read -p "Port (default: 22): " port
+    port=${port:-22}
+    [[ ! "$port" =~ ^[0-9]+$ ]] && warn "Invalid port, using 22" && port=22
 
-    read -p "Private key path (optional, expanded ~): " key
-    read -p "Password (optional, encrypted with GPG - prefer keys): " password
+    read -p "Private key path (optional): " key
+    read -s -p "Password (optional, will be encrypted): " password
+    echo
     read -p "Jump server (optional): " jump
     read -p "Group (optional): " group
     group=${group:-""}
+    read -p "Port forwards (optional, format: local:remote:port): " port_forward
+    read -p "Description (optional): " description
+    read -p "Tags (comma-separated, optional): " tags
     read -p "Background color (optional): " bg_color
     read -p "Foreground color (optional): " fg_color
 
-    enc_pw=""
+    local enc_pw=""
     if [[ -n "$password" ]]; then
-        echo "Encrypting password (GPG will prompt for passphrase)..."
-        enc_pw=$(echo -n "$password" | gpg --symmetric --armor --trust-model always 2>/dev/null | base64 -w0)
-        if [[ $? -ne 0 || -z "$enc_pw" ]]; then
-            echo "Error: GPG encryption failed. Ensure 'gpg-agent' is running and GPG_TTY is set (export GPG_TTY=$(tty))."
-            echo "Install pinentry-curses ('apt install pinentry-curses') for CLI prompts."
-            return 1
-        fi
-        echo "Password encrypted."
+        enc_pw=$(encrypt_password "$password") || return 1
+        info "Password encrypted successfully"
     fi
 
+    acquire_lock || return 1
+    
     jq --arg n "$name" \
        --arg h "$host" \
        --arg u "$user" \
@@ -166,76 +421,97 @@ add_session() {
        --arg enc_pw "$enc_pw" \
        --arg j "$jump" \
        --arg g "$group" \
+       --arg pf "$port_forward" \
+       --arg desc "$description" \
+       --arg t "$tags" \
        --arg bg "$bg_color" \
        --arg fg "$fg_color" \
-       '.[$n] = {host: $h, user: $u, port: ($p | tonumber), key: $k, password_encrypted: $enc_pw, jump: $j, group: $g, bg_color: $bg, fg_color: $fg}' \
-       "$SESSIONS_FILE" > "$SESSIONS_FILE.tmp" && mv "$SESSIONS_FILE.tmp" "$SESSIONS_FILE"
-
-    echo "Added session '$name' to $SESSIONS_FILE."
+       '.[$n] = {
+           host: $h,
+           user: $u,
+           port: ($p | tonumber),
+           key: $k,
+           password_encrypted: $enc_pw,
+           jump: $j,
+           group: $g,
+           port_forward: $pf,
+           description: $desc,
+           tags: $t,
+           bg_color: $bg,
+           fg_color: $fg,
+           created: now,
+           modified: now
+       }' "$SESSIONS_FILE" | atomic_write "$SESSIONS_FILE"
+    
+    release_lock
+    info "Added session '$name' to $SESSIONS_FILE"
 }
 
-# Function to edit existing session
 edit_session() {
-    if [[ ! -f "$SESSIONS_FILE" ]]; then
-        echo "No sessions.json found."
-        return 1
-    fi
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions.json found" && return 1
+    
+    local session_names
     session_names=$(jq -r 'keys[]' "$SESSIONS_FILE")
+    
+    local selected
     selected=$(echo "$session_names" | fzf --prompt="Select session to edit: " \
       --reverse \
-      --preview "jq -r '.\"{}\" | to_entries[] | \"\(.key): \(.value)\"' \"$SESSIONS_FILE\"" \
+      --preview "jq -r --arg k '{}' '.[\$k] | to_entries[] | \"\(.key): \(.value)\"' \"$SESSIONS_FILE\"" \
       --preview-window=right:50)
-    if [[ -z "$selected" ]]; then
-        echo "No session selected."
-        return 0
-    fi
+    
+    [[ -z "$selected" ]] && info "No session selected" && return 0
 
     # Extract current values
-    current_host=$(jq -r --arg k "$selected" '.[$k].host // empty' "$SESSIONS_FILE")
-    current_user=$(jq -r --arg k "$selected" '.[$k].user // empty' "$SESSIONS_FILE")
-    current_port=$(jq -r --arg k "$selected" '.[$k].port // 22' "$SESSIONS_FILE")
-    current_key=$(jq -r --arg k "$selected" '.[$k].key // empty' "$SESSIONS_FILE")
-    current_password_enc=$(jq -r --arg k "$selected" '.[$k].password_encrypted // empty' "$SESSIONS_FILE")
-    current_jump=$(jq -r --arg k "$selected" '.[$k].jump // empty' "$SESSIONS_FILE")
-    current_group=$(jq -r --arg k "$selected" '.[$k].group // empty' "$SESSIONS_FILE")
-    current_bg_color=$(jq -r --arg k "$selected" '.[$k].bg_color // empty' "$SESSIONS_FILE")
-    current_fg_color=$(jq -r --arg k "$selected" '.[$k].fg_color // empty' "$SESSIONS_FILE")
+    local current
+    current=$(jq -r --arg k "$selected" '.[$k]' "$SESSIONS_FILE")
+    
+    local current_host=$(echo "$current" | jq -r '.host // empty')
+    local current_user=$(echo "$current" | jq -r '.user // empty')
+    local current_port=$(echo "$current" | jq -r '.port // 22')
+    local current_key=$(echo "$current" | jq -r '.key // empty')
+    local current_jump=$(echo "$current" | jq -r '.jump // empty')
+    local current_group=$(echo "$current" | jq -r '.group // empty')
+    local current_pf=$(echo "$current" | jq -r '.port_forward // empty')
+    local current_desc=$(echo "$current" | jq -r '.description // empty')
+    local current_tags=$(echo "$current" | jq -r '.tags // empty')
+    local current_bg=$(echo "$current" | jq -r '.bg_color // empty')
+    local current_fg=$(echo "$current" | jq -r '.fg_color // empty')
 
-    # Prompt with defaults
-    read -p "Host/IP (current: $current_host): " host
+    read -p "Host (current: $current_host): " host
     host=${host:-$current_host}
     read -p "User (current: $current_user): " user
     user=${user:-$current_user}
     read -p "Port (current: $current_port): " port
     port=${port:-$current_port}
-    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
-        echo "Invalid port, using current $current_port."
-        port=$current_port
-    fi
-    read -p "Private key path (current: $current_key): " key
+    read -p "Key (current: $current_key): " key
     key=${key:-$current_key}
-    read -p "Password (leave blank to keep encrypted, enter new to re-encrypt): " password
-    read -p "Jump server (current: $current_jump): " jump
+    read -s -p "Password (leave blank to keep current, enter new to change): " password
+    echo
+    read -p "Jump (current: $current_jump): " jump
     jump=${jump:-$current_jump}
     read -p "Group (current: $current_group): " group
     group=${group:-$current_group}
-    read -p "Background color (current: $current_bg_color): " bg_color
-    bg_color=${bg_color:-$current_bg_color}
-    read -p "Foreground color (current: $current_fg_color): " fg_color
-    fg_color=${fg_color:-$current_fg_color}
+    read -p "Port forward (current: $current_pf): " port_forward
+    port_forward=${port_forward:-$current_pf}
+    read -p "Description (current: $current_desc): " description
+    description=${description:-$current_desc}
+    read -p "Tags (current: $current_tags): " tags
+    tags=${tags:-$current_tags}
+    read -p "BG color (current: $current_bg): " bg_color
+    bg_color=${bg_color:-$current_bg}
+    read -p "FG color (current: $current_fg): " fg_color
+    fg_color=${fg_color:-$current_fg}
 
-    enc_pw="$current_password_enc"
+    local enc_pw
+    enc_pw=$(echo "$current" | jq -r '.password_encrypted // empty')
+    
     if [[ -n "$password" ]]; then
-        echo "Encrypting new password..."
-        enc_pw=$(echo -n "$password" | gpg --symmetric --armor --trust-model always 2>/dev/null | base64 -w0)
-        if [[ $? -ne 0 || -z "$enc_pw" ]]; then
-            echo "Error: GPG encryption failed."
-            return 1
-        fi
-        echo "Password encrypted."
+        enc_pw=$(encrypt_password "$password") || return 1
+        info "Password encrypted successfully"
     fi
 
-    # Update JSON
+    acquire_lock || return 1
+    
     jq --arg n "$selected" \
        --arg h "$host" \
        --arg u "$user" \
@@ -244,680 +520,844 @@ edit_session() {
        --arg enc_pw "$enc_pw" \
        --arg j "$jump" \
        --arg g "$group" \
+       --arg pf "$port_forward" \
+       --arg desc "$description" \
+       --arg t "$tags" \
        --arg bg "$bg_color" \
        --arg fg "$fg_color" \
-       '.[$n] = {host: $h, user: $u, port: ($p | tonumber), key: $k, password_encrypted: $enc_pw, jump: $j, group: $g, bg_color: $bg, fg_color: $fg}' \
-       "$SESSIONS_FILE" > "$SESSIONS_FILE.tmp" && mv "$SESSIONS_FILE.tmp" "$SESSIONS_FILE"
-
-    echo "Updated session '$selected'."
+       '.[$n] += {
+           host: $h,
+           user: $u,
+           port: ($p | tonumber),
+           key: $k,
+           password_encrypted: $enc_pw,
+           jump: $j,
+           group: $g,
+           port_forward: $pf,
+           description: $desc,
+           tags: $t,
+           bg_color: $bg,
+           fg_color: $fg,
+           modified: now
+       }' "$SESSIONS_FILE" | atomic_write "$SESSIONS_FILE"
+    
+    release_lock
+    info "Updated session '$selected'"
 }
 
-# Function to remove sessions interactively
 remove_session() {
-    if [[ ! -f "$SESSIONS_FILE" ]]; then
-        echo "No sessions.json found. Nothing to remove."
-        return 1
-    fi
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions.json found" && return 1
 
+    local session_names
     session_names=$(jq -r 'keys[]' "$SESSIONS_FILE")
-    if [[ -z "$session_names" ]]; then
-        echo "No sessions to remove."
-        return 1
-    fi
+    [[ -z "$session_names" ]] && error "No sessions to remove" && return 1
 
+    local to_remove
     to_remove=$(echo "$session_names" | fzf --multi --reverse \
-      --prompt="Select SSH sessions: " \
-      --preview "jq -r '.\"{}\" | to_entries[] | \"\(.key): \(.value)\"' \"$SESSIONS_FILE\"" \
-      --preview-window=right:50:border)
+      --prompt="Select sessions to remove: " \
+      --preview "jq -r --arg k '{}' '.[\$k] | to_entries[] | \"\(.key): \(.value)\"' '$SESSIONS_FILE'" \
+      --preview-window=right:50)
 
-    if [[ -z "$to_remove" ]]; then
-        echo "No session selected for removal."
-        return 0
-    fi
+    [[ -z "$to_remove" ]] && info "No session selected" && return 0
 
-    backup_file="$SESSIONS_FILE.backup-$(date +%Y%m%d_%H%M%S)"
+    local backup_file="$BACKUP_DIR/sessions-$(date +%Y%m%d_%H%M%S).json"
     cp "$SESSIONS_FILE" "$backup_file"
-    echo "Backup created: $backup_file"
+    info "Backup created: $backup_file"
 
-    temp_file="$SESSIONS_FILE.tmp"
-    cp "$SESSIONS_FILE" "$temp_file"
-    for session in $to_remove; do
-        if [[ -n "$session" ]]; then
-            jq "del(.[\"$session\"])" "$temp_file" > "$temp_file.$$" && mv "$temp_file.$$" "$temp_file"
-        fi
-    done
-    mv "$temp_file" "$SESSIONS_FILE"
-
-    echo "Removed selected sessions. Backup: $backup_file"
+    acquire_lock || return 1
+    
+    local temp_content
+    temp_content=$(cat "$SESSIONS_FILE")
+    
+    while IFS= read -r session; do
+        [[ -n "$session" ]] && temp_content=$(echo "$temp_content" | jq "del(.[\"$session\"])")
+    done <<< "$to_remove"
+    
+    echo "$temp_content" | atomic_write "$SESSIONS_FILE"
+    release_lock
+    
+    info "Removed selected sessions"
 }
 
-# Function to parse ~/.ssh/config to temporary JSON
-parse_config_to_json() {
+bulk_edit() {
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions.json found" && return 1
+
+    local session_names
+    session_names=$(jq -r 'keys[]' "$SESSIONS_FILE")
+    
+    local selected
+    selected=$(echo "$session_names" | fzf --multi --reverse \
+      --prompt="Select sessions for bulk edit: " \
+      --preview "jq -r --arg k '{}' '.[\$k] | to_entries[] | \"\(.key): \(.value)\"' '$SESSIONS_FILE'" \
+      --preview-window=right:50)
+    
+    [[ -z "$selected" ]] && info "No sessions selected" && return 0
+
+    echo "Bulk edit options (leave blank to skip):"
+    read -p "Set group: " new_group
+    read -p "Set jump server: " new_jump
+    read -p "Set background color: " new_bg
+    read -p "Set foreground color: " new_fg
+    read -p "Add tags (comma-separated): " new_tags
+
+    acquire_lock || return 1
+    
+    local temp_content
+    temp_content=$(cat "$SESSIONS_FILE")
+    
+    while IFS= read -r session; do
+        if [[ -n "$session" ]]; then
+            [[ -n "$new_group" ]] && temp_content=$(echo "$temp_content" | jq --arg s "$session" --arg v "$new_group" '.[$s].group = $v')
+            [[ -n "$new_jump" ]] && temp_content=$(echo "$temp_content" | jq --arg s "$session" --arg v "$new_jump" '.[$s].jump = $v')
+            [[ -n "$new_bg" ]] && temp_content=$(echo "$temp_content" | jq --arg s "$session" --arg v "$new_bg" '.[$s].bg_color = $v')
+            [[ -n "$new_fg" ]] && temp_content=$(echo "$temp_content" | jq --arg s "$session" --arg v "$new_fg" '.[$s].fg_color = $v')
+            if [[ -n "$new_tags" ]]; then
+                local existing_tags
+                existing_tags=$(echo "$temp_content" | jq -r --arg s "$session" '.[$s].tags // empty')
+                local combined_tags="${existing_tags:+$existing_tags,}$new_tags"
+                temp_content=$(echo "$temp_content" | jq --arg s "$session" --arg v "$combined_tags" '.[$s].tags = $v')
+            fi
+        fi
+    done <<< "$selected"
+    
+    echo "$temp_content" | atomic_write "$SESSIONS_FILE"
+    release_lock
+    
+    info "Bulk edit completed"
+}
+
+# ============================================================================
+# SSH CONFIG SYNC
+# ============================================================================
+
+parse_ssh_config() {
     local config_file="$HOME/.ssh/config"
-    local temp_json=$(mktemp)
+    local temp_json
+    temp_json=$(mktemp)
     echo '{}' > "$temp_json"
 
-    echo "$(date): Starting config parsing" >> "$LOG_FILE"
+    [[ ! -f "$config_file" ]] && echo "$temp_json" && return 0
 
-    if [[ -f "$config_file" ]]; then
-        echo "$(date): Parsing ~/.ssh/config file..." >> "$LOG_FILE"
-        local current_host=""
-        local user=""
-        local hostname=""
-        local port=22
-        local key=""
-        local jump=""
+    log "INFO" "Parsing ~/.ssh/config"
 
-        while IFS= read -r line; do
-            line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            echo "$(date): Processing line: '$line'" >> "$LOG_FILE"
-            if [[ "$line" =~ ^Host[[:space:]]+(.*) ]]; then
-                local captured="${BASH_REMATCH[1]}"
-                if [[ -n "$current_host" ]]; then
-                    local h_host="$hostname"
-                    if [[ -z "$h_host" ]]; then
-                        h_host="$current_host"
-                    fi
-                    if [[ -z "$user" ]]; then
-                        user=$(whoami)
-                    fi
-                    echo "$(date): Adding host '$current_host': user='$user', host='$h_host', port=$port, key='$key', jump='$jump'" >> "$LOG_FILE"
-                    jq --arg h "$current_host" \
-                       --arg hn "$h_host" \
-                       --arg u "$user" \
-                       --arg p "$port" \
-                       --arg k "$key" \
-                       --arg j "$jump" \
-                       '.[$h] = {host: $hn, user: $u, port: ($p | tonumber), key: $k, password_encrypted: "", jump: $j, group: "", bg_color: "", fg_color: ""}' \
-                       "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
-                fi
-                current_host="$captured"
-                if [[ -z "$current_host" ]]; then
-                    echo "$(date): Invalid empty Host line: '$line'" >> "$LOG_FILE"
-                    continue
-                fi
-                user=""
-                hostname=""
-                port=22
-                key=""
-                jump=""
-                echo "$(date): Starting new host block: '$current_host'" >> "$LOG_FILE"
-            elif [[ "$line" =~ ^[[:space:]]*HostName[[:space:]]+(.*) ]]; then
-                hostname="${BASH_REMATCH[1]}"
-                echo "$(date): HostName: '$hostname'" >> "$LOG_FILE"
-            elif [[ "$line" =~ ^[[:space:]]*User[[:space:]]+(.*) ]]; then
-                user="${BASH_REMATCH[1]}"
-                echo "$(date): User: '$user'" >> "$LOG_FILE"
-            elif [[ "$line" =~ ^[[:space:]]*Port[[:space:]]+(.*) ]]; then
-                port="${BASH_REMATCH[1]}"
-                echo "$(date): Port: $port" >> "$LOG_FILE"
-            elif [[ "$line" =~ ^[[:space:]]*IdentityFile[[:space:]]+(.*) ]]; then
-                key="${BASH_REMATCH[1]}"
-                if [[ "$key" == ~* ]]; then
-                    key=$(eval echo "$key")
-                fi
-                echo "$(date): IdentityFile: '$key'" >> "$LOG_FILE"
-            elif [[ "$line" =~ ^[[:space:]]*ProxyJump[[:space:]]+(.*) ]]; then
-                jump="${BASH_REMATCH[1]}"
-                echo "$(date): ProxyJump: '$jump'" >> "$LOG_FILE"
-            else
-                if [[ -n "$line" ]]; then
-                    echo "$(date): Skipping unmatched line: '$line'" >> "$LOG_FILE"
-                fi
-            fi
-        done < "$config_file"
+    local current_host="" user="" hostname="" port=22 key="" jump=""
 
-        if [[ -n "$current_host" ]]; then
-            local h_host="$hostname"
-            if [[ -z "$h_host" ]]; then
-                h_host="$current_host"
+    while IFS= read -r line; do
+        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        
+        if [[ "$line" =~ ^Host[[:space:]]+(.*) ]]; then
+            if [[ -n "$current_host" ]]; then
+                local h_host="${hostname:-$current_host}"
+                local h_user="${user:-$(whoami)}"
+                
+                jq --arg h "$current_host" \
+                   --arg hn "$h_host" \
+                   --arg u "$h_user" \
+                   --arg p "$port" \
+                   --arg k "$key" \
+                   --arg j "$jump" \
+                   '.[$h] = {host: $hn, user: $u, port: ($p | tonumber), key: $k, password_encrypted: "", jump: $j, group: "", port_forward: "", description: "", tags: "", bg_color: "", fg_color: "", created: now, modified: now}' \
+                   "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
             fi
-            if [[ -z "$user" ]]; then
-                user=$(whoami)
-            fi
-            echo "$(date): Adding last host '$current_host': user='$user', host='$h_host', port=$port, key='$key', jump='$jump'" >> "$LOG_FILE"
-            jq --arg h "$current_host" \
-               --arg hn "$h_host" \
-               --arg u "$user" \
-               --arg p "$port" \
-               --arg k "$key" \
-               --arg j "$jump" \
-               '.[$h] = {host: $hn, user: $u, port: ($p | tonumber), key: $k, password_encrypted: "", jump: $j, group: "", bg_color: "", fg_color: ""}' \
-               "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
+            
+            current_host="${BASH_REMATCH[1]}"
+            user="" hostname="" port=22 key="" jump=""
+            
+        elif [[ "$line" =~ ^HostName[[:space:]]+(.*) ]]; then
+            hostname="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^User[[:space:]]+(.*) ]]; then
+            user="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^Port[[:space:]]+(.*) ]]; then
+            port="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^IdentityFile[[:space:]]+(.*) ]]; then
+            key="${BASH_REMATCH[1]}"
+            [[ "$key" == ~* ]] && key=$(eval echo "$key")
+        elif [[ "$line" =~ ^ProxyJump[[:space:]]+(.*) ]]; then
+            jump="${BASH_REMATCH[1]}"
         fi
+    done < "$config_file"
+
+    # Handle last host
+    if [[ -n "$current_host" ]]; then
+        local h_host="${hostname:-$current_host}"
+        local h_user="${user:-$(whoami)}"
+        
+        jq --arg h "$current_host" \
+           --arg hn "$h_host" \
+           --arg u "$h_user" \
+           --arg p "$port" \
+           --arg k "$key" \
+           --arg j "$jump" \
+           '.[$h] = {host: $hn, user: $u, port: ($p | tonumber), key: $k, password_encrypted: "", jump: $j, group: "", port_forward: "", description: "", tags: "", bg_color: "", fg_color: "", created: now, modified: now}' \
+           "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
     fi
 
     echo "$temp_json"
 }
 
-# Function to sync sessions.json with ~/.ssh/config
 sync_sessions() {
     local prune=false
-    if [[ "$1" == "--prune" ]]; then
-        prune=true
-        shift
-    fi
-    local temp_json=$(parse_config_to_json)
+    [[ "$1" == "--prune" ]] && prune=true
+
+    local temp_json
+    temp_json=$(parse_ssh_config)
+
+    acquire_lock || return 1
 
     if [[ -f "$SESSIONS_FILE" ]]; then
-        echo "$(date): Syncing with existing $SESSIONS_FILE" >> "$LOG_FILE"
+        log "INFO" "Syncing with existing sessions.json"
+        
         local config_keys
         config_keys=$(jq -r 'keys[]' "$temp_json" 2>/dev/null || true)
+        
+        local current_content
+        current_content=$(cat "$SESSIONS_FILE")
+        
         while IFS= read -r key; do
-            if [[ -n "$key" ]]; then
-                local hn u p id_key j current_pw_enc current_group current_bg_color current_fg_color
-                hn=$(jq -r --arg k "$key" '.[$k].host // empty' "$temp_json")
-                u=$(jq -r --arg k "$key" '.[$k].user // empty' "$temp_json")
-                p=$(jq -r --arg k "$key" '.[$k].port // 22' "$temp_json")
-                id_key=$(jq -r --arg k "$key" '.[$k].key // empty' "$temp_json")
-                j=$(jq -r --arg k "$key" '.[$k].jump // empty' "$temp_json")
-                current_pw_enc=$(jq -r --arg k "$key" '.[$k].password_encrypted // ""' "$SESSIONS_FILE")
-                current_group=$(jq -r --arg k "$key" '.[$k].group // ""' "$SESSIONS_FILE")
-                current_bg_color=$(jq -r --arg k "$key" '.[$k].bg_color // ""' "$SESSIONS_FILE")
-                current_fg_color=$(jq -r --arg k "$key" '.[$k].fg_color // ""' "$SESSIONS_FILE")
-                echo "$(date): Updating session '$key' from config" >> "$LOG_FILE"
-                jq --arg h "$key" \
-                   --arg hn "$hn" \
-                   --arg u "$u" \
-                   --arg p "$p" \
-                   --arg ky "$id_key" \
-                   --arg pw_enc "$current_pw_enc" \
-                   --arg j "$j" \
-                   --arg g "$current_group" \
-                   --arg bg "$current_bg_color" \
-                   --arg fg "$current_fg_color" \
-                   '.[$h] = {host: $hn, user: $u, port: ($p | tonumber), key: $ky, password_encrypted: $pw_enc, jump: $j, group: $g, bg_color: $bg, fg_color: $fg}' \
-                   "$SESSIONS_FILE" > "${SESSIONS_FILE}.tmp" && mv "${SESSIONS_FILE}.tmp" "$SESSIONS_FILE" || echo "Error updating $key" >> "$LOG_FILE"
+            [[ -z "$key" ]] && continue
+            
+            local new_data
+            new_data=$(jq -r --arg k "$key" '.[$k]' "$temp_json")
+            
+            local existing_data
+            existing_data=$(echo "$current_content" | jq -r --arg k "$key" '.[$k] // empty')
+            
+            if [[ -n "$existing_data" ]]; then
+                # Preserve sshmx-specific fields
+                local preserved
+                preserved=$(echo "$existing_data" | jq '{password_encrypted, group, port_forward, description, tags, bg_color, fg_color, created}')
+                
+                current_content=$(echo "$current_content" | jq --arg k "$key" --argjson new "$new_data" --argjson pres "$preserved" \
+                    '.[$k] = ($new + $pres + {modified: now})')
+            else
+                current_content=$(echo "$current_content" | jq --arg k "$key" --argjson new "$new_data" '.[$k] = $new')
             fi
         done <<< "$config_keys"
 
         if $prune; then
-            session_keys=$(jq -r 'keys[]' "$SESSIONS_FILE")
+            local session_keys
+            session_keys=$(echo "$current_content" | jq -r 'keys[]')
             for sk in $session_keys; do
                 if ! echo "$config_keys" | grep -q "^$sk$"; then
-                    echo "$(date): Pruning session '$sk' not in ~/.ssh/config" >> "$LOG_FILE"
-                    jq "del(.[\"$sk\"])" "$SESSIONS_FILE" > "${SESSIONS_FILE}.tmp" && mv "${SESSIONS_FILE}.tmp" "$SESSIONS_FILE"
+                    log "INFO" "Pruning session '$sk' not in ~/.ssh/config"
+                    current_content=$(echo "$current_content" | jq "del(.[\"$sk\"])")
                 fi
             done
         fi
+        
+        echo "$current_content" | atomic_write "$SESSIONS_FILE"
     else
-        echo "$(date): No existing $SESSIONS_FILE, creating from config" >> "$LOG_FILE"
         cp "$temp_json" "$SESSIONS_FILE"
     fi
 
-    local num_hosts=$(jq 'keys | length' "$SESSIONS_FILE")
-    if [[ "$num_hosts" -eq 0 ]]; then
-        local sample_host="example-host"
-        echo "$(date): No sessions found, adding sample host." >> "$LOG_FILE"
-        jq --arg h "SampleHost" \
-           --arg hn "$sample_host" \
-           --arg u "user" \
-           --arg p "22" \
-           --arg k "~/.ssh/id_ed25519" \
-           --arg j "" \
-           '.[$h] = {host: $hn, user: $u, port: ($p | tonumber), key: $k, password_encrypted: "", jump: $j, group: "", bg_color: "", fg_color: ""}' \
-           "$SESSIONS_FILE" > "${SESSIONS_FILE}.tmp" && mv "${SESSIONS_FILE}.tmp" "$SESSIONS_FILE"
-    fi
     rm -f "$temp_json"
-    echo "Synced $SESSIONS_FILE with ~/.ssh/config."
-    echo "$(date): Generated JSON content:" >> "$LOG_FILE"
-    cat "$SESSIONS_FILE" >> "$LOG_FILE"
+    release_lock
+    
+    info "Synced sessions.json with ~/.ssh/config"
 }
 
-# Function to connect to a group
-group_connect() {
-    groups=$(jq -r '.[] | .group' "$SESSIONS_FILE" | grep -v '^$' | sort -u)
-    selected_groups=$(echo "$groups" | fzf --multi --reverse --prompt="Select groups to connect to all hosts: ")
-    if [[ -n "$selected_groups" ]]; then
-        selected=$(echo "$selected_groups" | while IFS= read -r grp; do
-            if [[ -n "$grp" ]]; then
-                jq -r --arg g "$grp" 'to_entries[] | select(.value.group == $g) | .key' "$SESSIONS_FILE"
-            fi
-        done | sort -u | grep -v '^$')
+export_to_ssh_config() {
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions.json found" && return 1
+    
+    local output_file="${1:-$HOME/.ssh/config.sshmx-export}"
+    local backup_file="$BACKUP_DIR/ssh-config-$(date +%Y%m%d_%H%M%S)"
+    
+    if [[ -f "$output_file" ]]; then
+        cp "$output_file" "$backup_file"
+        info "Backed up existing config to $backup_file"
     fi
-    if [[ -z "${selected:-}" ]]; then
-        echo "No groups selected."
-        exit 0
-    fi
+    
+    {
+        echo "# Generated by sshmx on $(date)"
+        echo "# Original backed up to: $backup_file"
+        echo ""
+        
+        jq -r 'to_entries[] | 
+            "Host \(.key)\n" +
+            "    HostName \(.value.host)\n" +
+            "    User \(.value.user)\n" +
+            "    Port \(.value.port)\n" +
+            (if .value.key != "" then "    IdentityFile \(.value.key)\n" else "" end) +
+            (if .value.jump != "" then "    ProxyJump \(.value.jump)\n" else "" end) +
+            "\n"' "$SESSIONS_FILE"
+    } > "$output_file"
+    
+    info "Exported to $output_file"
 }
 
-# Function to export sessions.json
-export_sessions() {
-    if [[ ! -f "$SESSIONS_FILE" ]]; then
-        echo "No sessions.json found to export."
-        return 1
-    fi
+# ============================================================================
+# TEMPLATES
+# ============================================================================
 
-    local export_file
-    if [[ -n "$2" ]]; then
-        export_file="$2"
-    else
-        read -p "Enter export filename (default: sessions-backup-$(date +%Y%m%d_%H%M%S).json): " export_file
-        export_file=${export_file:-"sessions-backup-$(date +%Y%m%d_%H%M%S).json"}
-    fi
-
-    cp "$SESSIONS_FILE" "$export_file"
-    echo "Exported sessions to $export_file."
+add_template() {
+    info "Adding new session template"
+    
+    read -p "Template name: " name
+    [[ -z "$name" ]] && error "Template name cannot be empty" && return 1
+    
+    read -p "User: " user
+    read -p "Port (default: 22): " port
+    port=${port:-22}
+    read -p "Key path: " key
+    read -p "Jump server: " jump
+    read -p "Group: " group
+    read -p "Description: " description
+    
+    acquire_lock || return 1
+    
+    jq --arg n "$name" \
+       --arg u "$user" \
+       --arg p "$port" \
+       --arg k "$key" \
+       --arg j "$jump" \
+       --arg g "$group" \
+       --arg desc "$description" \
+       '.[$n] = {user: $u, port: ($p | tonumber), key: $k, jump: $j, group: $g, description: $desc}' \
+       "$TEMPLATES_FILE" | atomic_write "$TEMPLATES_FILE"
+    
+    release_lock
+    info "Template '$name' saved"
 }
 
-# Function to import sessions.json
-import_sessions() {
-    local import_file
-    if [[ -n "$2" ]]; then
-        import_file="$2"
-    else
-        read -p "Enter import filename: " import_file
-    fi
+use_template() {
+    [[ ! -f "$TEMPLATES_FILE" ]] && error "No templates found" && return 1
+    
+    local template_names
+    template_names=$(jq -r 'keys[]' "$TEMPLATES_FILE")
+    [[ -z "$template_names" ]] && error "No templates available" && return 1
+    
+    local selected
+    selected=$(echo "$template_names" | fzf --prompt="Select template: " \
+      --preview "jq -r --arg k '{}' '.[\$k] | to_entries[] | \"\(.key): \(.value)\"' '$TEMPLATES_FILE'" \
+      --preview-window=right:50)
+    
+    [[ -z "$selected" ]] && info "No template selected" && return 0
+    
+    read -p "Session name: " name
+    [[ -z "$name" ]] && error "Session name cannot be empty" && return 1
+    
+    read -p "Host/IP: " host
+    [[ -z "$host" ]] && error "Host cannot be empty" && return 1
+    
+    local template
+    template=$(jq -r --arg k "$selected" '.[$k]' "$TEMPLATES_FILE")
+    
+    local user=$(echo "$template" | jq -r '.user')
+    local port=$(echo "$template" | jq -r '.port')
+    local key=$(echo "$template" | jq -r '.key // empty')
+    local jump=$(echo "$template" | jq -r '.jump // empty')
+    local group=$(echo "$template" | jq -r '.group // empty')
+    local description=$(echo "$template" | jq -r '.description // empty')
+    
+    read -p "User (default: $user): " new_user
+    user=${new_user:-$user}
+    
+    acquire_lock || return 1
+    
+    jq --arg n "$name" \
+       --arg h "$host" \
+       --arg u "$user" \
+       --arg p "$port" \
+       --arg k "$key" \
+       --arg j "$jump" \
+       --arg g "$group" \
+       --arg desc "$description" \
+       '.[$n] = {
+           host: $h,
+           user: $u,
+           port: ($p | tonumber),
+           key: $k,
+           password_encrypted: "",
+           jump: $j,
+           group: $g,
+           port_forward: "",
+           description: $desc,
+           tags: "",
+           bg_color: "",
+           fg_color: "",
+           created: now,
+           modified: now
+       }' "$SESSIONS_FILE" | atomic_write "$SESSIONS_FILE"
+    
+    release_lock
+    info "Created session '$name' from template '$selected'"
+}
 
-    if [[ ! -f "$import_file" ]]; then
-        echo "Import file not found: $import_file"
-        return 1
-    fi
+list_templates() {
+    [[ ! -f "$TEMPLATES_FILE" ]] && error "No templates found" && return 1
+    
+    local template_names
+    template_names=$(jq -r 'keys[]' "$TEMPLATES_FILE")
+    [[ -z "$template_names" ]] && error "No templates available" && return 1
+    
+    echo "$template_names" | fzf --prompt="Templates: " --reverse \
+      --preview "jq -r --arg k '{}' '.[\$k] | to_entries[] | \"\(.key): \(.value)\"' '$TEMPLATES_FILE'" \
+      --preview-window=right:50 \
+      --bind 'enter:execute(echo "Selected: {}" | less)+abort'
+}
 
-    if [[ ! -f "$SESSIONS_FILE" ]]; then
-        echo "No existing sessions.json, creating from import."
-        cp "$import_file" "$SESSIONS_FILE"
-        echo "Imported sessions from $import_file."
+# ============================================================================
+# HISTORY & FAVORITES
+# ============================================================================
+
+log_connection() {
+    local session="$1"
+    
+    # Don't fail on history logging errors
+    if ! acquire_lock; then
+        warn "Could not acquire lock for history logging"
         return 0
     fi
-
-    local backup_file="$SESSIONS_FILE.backup-$(date +%Y%m%d_%H%M%S)"
-    cp "$SESSIONS_FILE" "$backup_file"
-    echo "Backed up current sessions to $backup_file."
-
-    cp "$import_file" "$SESSIONS_FILE"
-    echo "Imported sessions from $import_file (overwrote existing)."
+    
+    jq --arg s "$session" --arg t "$(date +%s)" \
+       '.connections += [{session: $s, timestamp: ($t | tonumber)}] | 
+        .connections |= sort_by(.timestamp) | 
+        .connections |= if length > 100 then .[-100:] else . end' \
+       "$HISTORY_FILE" | atomic_write "$HISTORY_FILE"
+    
+    release_lock
 }
 
-# Function to migrate plain passwords to encrypted
-migrate_passwords() {
-    if [[ ! -f "$SESSIONS_FILE" ]] || ! jq -e '.[].password' "$SESSIONS_FILE" >/dev/null 2>&1; then
-        return 0
+show_history() {
+    [[ ! -f "$HISTORY_FILE" ]] && error "No history found" && return 1
+    
+    local history
+    history=$(jq -r '.connections[] | .session' "$HISTORY_FILE" | tac | awk '!seen[$0]++')
+    
+    [[ -z "$history" ]] && error "No connection history" && return 1
+    
+    local selected
+    selected=$(echo "$history" | fzf --multi --reverse \
+      --prompt="Connection History (most recent first): " \
+      --preview "jq -r --arg k '{}' '.[\$k] | to_entries[] | \"\(.key): \(.value)\"' '$SESSIONS_FILE' 2>/dev/null || echo 'Session not found'" \
+      --preview-window=right:50)
+    
+    echo "$selected"
+}
+
+add_favorite() {
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions found" && return 1
+    
+    local session_names
+    session_names=$(jq -r 'keys[]' "$SESSIONS_FILE")
+    
+    local selected
+    selected=$(echo "$session_names" | fzf --multi --reverse \
+      --prompt="Select sessions to add to favorites: " \
+      --preview "jq -r --arg k '{}' '.[\$k] | to_entries[] | \"\(.key): \(.value)\"' '$SESSIONS_FILE'" \
+      --preview-window=right:50)
+    
+    [[ -z "$selected" ]] && info "No sessions selected" && return 0
+    
+    acquire_lock || return 1
+    
+    local temp_content
+    temp_content=$(cat "$HISTORY_FILE")
+    
+    while IFS= read -r session; do
+        [[ -n "$session" ]] && temp_content=$(echo "$temp_content" | jq --arg s "$session" \
+            'if (.favorites | index($s)) then . else .favorites += [$s] end')
+    done <<< "$selected"
+    
+    echo "$temp_content" | atomic_write "$HISTORY_FILE"
+    release_lock
+    
+    info "Added to favorites"
+}
+
+show_favorites() {
+    [[ ! -f "$HISTORY_FILE" ]] && error "No history file found" && return 1
+    
+    local favorites
+    favorites=$(jq -r '.favorites[]?' "$HISTORY_FILE")
+    
+    [[ -z "$favorites" ]] && error "No favorites" && return 1
+    
+    local selected
+    selected=$(echo "$favorites" | fzf --multi --reverse \
+      --prompt="Favorites: " \
+      --preview "jq -r --arg k '{}' '.[\$k] | to_entries[] | \"\(.key): \(.value)\"' '$SESSIONS_FILE' 2>/dev/null || echo 'Session not found'" \
+      --preview-window=right:50)
+    
+    echo "$selected"
+}
+
+# ============================================================================
+# HEALTH CHECKS
+# ============================================================================
+
+check_host() {
+    local host="$1"
+    local port="${2:-22}"
+    local timeout="${3:-2}"
+    
+    if command -v nc &>/dev/null; then
+        timeout "$timeout" nc -zv "$host" "$port" 2>&1 | grep -q succeeded
+    else
+        timeout "$timeout" bash -c "echo >/dev/tcp/$host/$port" 2>/dev/null
     fi
-    echo "Detected plain-text passwords in $SESSIONS_FILE. Migrating to GPG-encrypted..." >> $LOG_FILE
-    local temp_json=$(mktemp)
-    cp "$SESSIONS_FILE" "$temp_json"
-    local session_keys=$(jq -r 'keys[]' "$temp_json")
-    for key in $session_keys; do
-        local plain_pw=$(jq -r --arg k "$key" '.[$k].password // empty' "$temp_json")
-        local enc_pw=""
-        if [[ -n "$plain_pw" ]]; then
-            echo "Encrypting password for '$key'..."
-            enc_pw=$(echo -n "$plain_pw" | gpg --symmetric --armor --trust-model always 2>/dev/null | base64 -w0)
-            if [[ $? -ne 0 || -z "$enc_pw" ]]; then
-                echo "Error: Failed to encrypt password for '$key'. Skipping migration for this session."
-                continue
-            fi
-            jq --arg k "$key" --arg enc_pw "$enc_pw" \
-               '.[$k].password_encrypted = $enc_pw | del(.[$k].password)' \
-               "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
+}
+
+check_session() {
+    local session="$1"
+    
+    local host port
+    host=$(jq -r --arg k "$session" '.[$k].host' "$SESSIONS_FILE")
+    port=$(jq -r --arg k "$session" '.[$k].port // 22' "$SESSIONS_FILE")
+    
+    if check_host "$host" "$port"; then
+        echo "✓ $session ($host:$port) - OK"
+        return 0
+    else
+        echo "✗ $session ($host:$port) - FAILED"
+        return 1
+    fi
+}
+
+check_all_sessions() {
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions found" && return 1
+    
+    local sessions
+    sessions=$(jq -r 'keys[]' "$SESSIONS_FILE")
+    
+    info "Checking all sessions..."
+    echo ""
+    
+    local ok=0 failed=0
+    while IFS= read -r session; do
+        if check_session "$session"; then
+            ((ok++))
+        else
+            ((failed++))
         fi
-    done
-    mv "$temp_json" "$SESSIONS_FILE"
-    echo "Migration complete. Plain passwords encrypted." >> $LOG_FILE
+    done <<< "$sessions"
+    
+    echo ""
+    info "Results: $ok OK, $failed FAILED"
 }
 
-# Function to multiplex
+interactive_health_check() {
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions found" && return 1
+    
+    local session_names
+    session_names=$(jq -r 'keys[]' "$SESSIONS_FILE")
+    
+    local selected
+    selected=$(echo "$session_names" | fzf --multi --reverse \
+      --prompt="Select sessions to check: " \
+      --preview "jq -r --arg k '{}' '.[\$k] | to_entries[] | \"\(.key): \(.value)\"' '$SESSIONS_FILE'" \
+      --preview-window=right:50)
+    
+    [[ -z "$selected" ]] && info "No sessions selected" && return 0
+    
+    echo ""
+    while IFS= read -r session; do
+        [[ -n "$session" ]] && check_session "$session"
+    done <<< "$selected"
+}
+
+# ============================================================================
+# GROUPS
+# ============================================================================
+
+group_connect() {
+    local groups
+    groups=$(jq -r '.[] | .group' "$SESSIONS_FILE" | grep -v '^$' | sort -u)
+    
+    [[ -z "$groups" ]] && error "No groups defined" && return 1
+    
+    local selected_groups
+    selected_groups=$(echo "$groups" | fzf --multi --reverse --prompt="Select groups: ")
+    
+    [[ -z "$selected_groups" ]] && info "No groups selected" && return 0
+    
+    local selected=""
+    while IFS= read -r grp; do
+        if [[ -n "$grp" ]]; then
+            local group_sessions
+            group_sessions=$(jq -r --arg g "$grp" 'to_entries[] | select(.value.group == $g) | .key' "$SESSIONS_FILE")
+            selected="${selected}${selected:+'\n'}${group_sessions}"
+        fi
+    done <<< "$selected_groups"
+    
+    selected=$(echo "$selected" | sort -u)
+    
+    [[ -z "$selected" ]] && error "No sessions in selected groups" && return 1
+    
+    # Return selected for main connection logic
+    echo "$selected"
+}
+
+# ============================================================================
+# MULTIPLEX / DEMULTIPLEX
+# ============================================================================
+
 multiplex() {
-    local session="sshmx"
-    local target_window="sync-input"
-    local MAP_FILE="${HOME}/.sshmx/sshmx-mapping"
+    local session="${1:-$DEFAULT_SESSION}"
+    local target_window="$SYNC_WINDOW"
 
-    echo "$(date '+%F %T') [INFO] Starting multiplex" >> "$LOG_FILE"
+    log "INFO" "Starting multiplex in session '$session'"
 
-    if tmux list-windows -t "$session" -F "#{window_name}" | grep -xq "$target_window"; then
-        echo "$(date '+%F %T') [WARN] $target_window already exists; aborting multiplex." | tee -a "$LOG_FILE"
+    if tmux list-windows -t "$session" -F "#{window_name}" 2>/dev/null | grep -xq "$target_window"; then
+        error "$target_window already exists. Demultiplex first or choose different window name."
         return 1
     fi
 
     local selection
-    selection=$(tmux list-windows -t "$session" -F "#S:#I:#W:#{window_id}" \
-        | fzf --multi --reverse --prompt="Select windows > " \
-              --preview '
-                  win_id=$(echo {} | cut -d: -f4);
-                  pane=$(tmux list-panes -t "$win_id" -F "#{pane_id}" 2>/dev/null | head -n1);
-                  [ -n "$pane" ] && tmux capture-pane -pt "$pane" -S -20 || echo "No pane found"
-              ' --preview-window=down:70%) || return 1
+    selection=$(tmux list-windows -t "$session" -F "#S:#I:#W:#{window_id}" 2>/dev/null \
+        | fzf --multi --reverse --prompt="Select windows to multiplex: " \
+              --preview 'win_id=$(echo {} | cut -d: -f4); pane=$(tmux list-panes -t "$win_id" -F "#{pane_id}" 2>/dev/null | head -n1); [ -n "$pane" ] && tmux capture-pane -pt "$pane" -S -20 || echo "No pane found"' \
+              --preview-window=down:70%) || return 1
 
-    [[ -z "$selection" ]] && echo "$(date '+%F %T') [INFO] No windows selected." >> "$LOG_FILE" && return 1
+    [[ -z "$selection" ]] && info "No windows selected" && return 0
 
     : > "$MAP_FILE"
-    echo "$(date '+%F %T') [INFO] Mapping file: $MAP_FILE" >> "$LOG_FILE"
+    log "INFO" "Mapping file: $MAP_FILE"
 
     mapfile -t windows <<< "$selection"
     local first="${windows[0]}"
     local first_id=$(echo "$first" | cut -d: -f4)
     local first_name=$(echo "$first" | cut -d: -f3)
-    if [[ -z "$first_id" ]]; then
-        echo "$(date '+%F %T') [ERROR] Unable to parse first window id. Aborting." >> "$LOG_FILE"
-        return 1
-    fi
+    
+    [[ -z "$first_id" ]] && error "Unable to parse first window id" && return 1
 
     mapfile -t first_panes < <(tmux list-panes -t "$first_id" -F "#{pane_id}" 2>/dev/null || true)
     for p in "${first_panes[@]}"; do
-        printf "%s|%s\n" "$p" "$first_name" >> "$MAP_FILE"
-        echo "$(date '+%F %T') [DEBUG] MAPPED %s -> %s" "$p" "$first_name" >> "$LOG_FILE"
+        local bg_color fg_color
+        # Get colors from window-style option
+        local style=$(tmux show-window-options -t "$first_id" -v window-style 2>/dev/null || echo "")
+        if [[ -n "$style" ]]; then
+            bg_color=$(echo "$style" | grep -o 'bg=[^,}]*' | cut -d= -f2)
+            fg_color=$(echo "$style" | grep -o 'fg=[^,}]*' | cut -d= -f2)
+        fi
+        [[ -z "$bg_color" ]] && bg_color="default"
+        [[ -z "$fg_color" ]] && fg_color="default"
+        printf "%s|%s|%s|%s\n" "$p" "$first_name" "$bg_color" "$fg_color" >> "$MAP_FILE"
+        log "DEBUG" "MAPPED $p -> $first_name (colors: fg=$fg_color bg=$bg_color)"
     done
 
     tmux rename-window -t "$first_id" "$target_window"
-    echo "$(date '+%F %T') [INFO] Renamed window id $first_id -> $target_window" >> "$LOG_FILE"
+    log "INFO" "Renamed window id $first_id -> $target_window"
 
-    local i
     for (( i=1; i<${#windows[@]}; i++ )); do
         local w="${windows[$i]}"
         local win_id=$(echo "$w" | cut -d: -f4)
         local win_name=$(echo "$w" | cut -d: -f3)
-        echo "$(date '+%F %T') [INFO] Processing window id $win_id (name: $win_name)" >> "$LOG_FILE"
+        log "INFO" "Processing window id $win_id (name: $win_name)"
 
         mapfile -t panes < <(tmux list-panes -t "$win_id" -F "#{pane_id}" 2>/dev/null || true)
-        if [[ ${#panes[@]} -eq 0 ]]; then
-            echo "$(date '+%F %T') [WARN] No panes found for window id $win_id" >> "$LOG_FILE"
-            continue
-        fi
+        
+        [[ ${#panes[@]} -eq 0 ]] && warn "No panes found for window id $win_id" && continue
 
         for p in "${panes[@]}"; do
-            printf "%s|%s\n" "$p" "$win_name" >> "$MAP_FILE"
-            echo "$(date '+%F %T') [DEBUG] MAPPED %s -> %s" "$p" "$win_name" >> "$LOG_FILE"
-            tmux join-pane -s "$p" -t "${session}:${target_window}"
-            if [[ $? -ne 0 ]]; then
-                echo "$(date '+%F %T') [ERROR] join-pane failed for pane $p" >> "$LOG_FILE"
+            local bg_color fg_color
+            # Get colors from window-style option
+            local style=$(tmux show-window-options -t "$win_id" -v window-style 2>/dev/null || echo "")
+            if [[ -n "$style" ]]; then
+                bg_color=$(echo "$style" | grep -o 'bg=[^,}]*' | cut -d= -f2)
+                fg_color=$(echo "$style" | grep -o 'fg=[^,}]*' | cut -d= -f2)
+            fi
+            [[ -z "$bg_color" ]] && bg_color="default"
+            [[ -z "$fg_color" ]] && fg_color="default"
+            printf "%s|%s|%s|%s\n" "$p" "$win_name" "$bg_color" "$fg_color" >> "$MAP_FILE"
+            log "DEBUG" "MAPPED $p -> $win_name (colors: fg=$fg_color bg=$bg_color)"
+            
+            if tmux join-pane -s "$p" -t "${session}:${target_window}" 2>/dev/null; then
+                log "INFO" "Joined pane $p into ${session}:${target_window}"
             else
-                echo "$(date '+%F %T') [INFO] Joined pane $p into ${session}:${target_window}" >> "$LOG_FILE"
+                error "join-pane failed for pane $p"
             fi
         done
+        
         tmux kill-window -t "$win_id" 2>/dev/null
-        echo "$(date '+%F %T') [INFO] Killed original window id $win_id" >> "$LOG_FILE"
+        log "INFO" "Killed original window id $win_id"
     done
 
     tmux setw -t "${session}:${target_window}" synchronize-panes on
     tmux select-layout -t "${session}:${target_window}" tiled
-    echo "$(date '+%F %T') [INFO] Completed multiplex; mapping saved to $MAP_FILE" >> "$LOG_FILE"
+    
+    info "Multiplexed windows. Synchronize-panes: ON"
+    info "Press prefix+: then 'setw synchronize-panes off' to disable sync"
+    log "INFO" "Completed multiplex; mapping saved to $MAP_FILE"
 }
 
-# Function to demultiplex
 demultiplex() {
-    local session="sshmx"
-    local target_window="sync-input"
-    local MAP_FILE="${HOME}/.sshmx/sshmx-mapping"
+    local session="${1:-$DEFAULT_SESSION}"
+    local target_window="$SYNC_WINDOW"
 
-    echo "$(date '+%F %T') [INFO] Starting demultiplex" >> "$LOG_FILE"
+    log "INFO" "Starting demultiplex in session '$session'"
 
-    if [[ ! -f "$MAP_FILE" ]]; then
-        echo "$(date '+%F %T') [WARN] No mapping file ($MAP_FILE) found. Aborting." >> "$LOG_FILE"
-        return 1
-    fi
+    [[ ! -f "$MAP_FILE" ]] && error "No mapping file found. Nothing to demultiplex." && return 1
 
-    while IFS='|' read -r pane orig_name; do
+    while IFS='|' read -r pane orig_name bg_color fg_color; do
         [[ -z "$pane" ]] && continue
-        if ! tmux list-panes -a -F "#{pane_id}" | grep -Fxq "$pane"; then
-            echo "$(date '+%F %T') [WARN] Pane $pane not found; skipping" >> "$LOG_FILE"
+        
+        if ! tmux list-panes -a -F "#{pane_id}" 2>/dev/null | grep -Fxq "$pane"; then
+            warn "Pane $pane not found; skipping"
             continue
         fi
 
-        tmux break-pane -s "$pane" -d
-        if [[ $? -ne 0 ]]; then
-            echo "$(date '+%F %T') [ERROR] break-pane failed for $pane" >> "$LOG_FILE"
+        if ! tmux break-pane -s "$pane" -d 2>/dev/null; then
+            error "break-pane failed for $pane"
             continue
         fi
 
-        new_win_id=$(tmux list-panes -a -F "#{pane_id} #{window_id}" \
+        local new_win_id
+        new_win_id=$(tmux list-panes -a -F "#{pane_id} #{window_id}" 2>/dev/null \
                      | awk -v p="$pane" '$1==p { print $2; exit }')
-        if [[ -z "$new_win_id" ]]; then
-            echo "$(date '+%F %T') [ERROR] Could not find new window for pane $pane" >> "$LOG_FILE"
-            continue
-        fi
+        
+        [[ -z "$new_win_id" ]] && error "Could not find new window for pane $pane" && continue
 
-        if [[ -z "$orig_name" ]]; then
-            orig_name="restored-window"
-        fi
-        tmux rename-window -t "$new_win_id" "$orig_name"
-        if [[ $? -ne 0 ]]; then
-            echo "$(date '+%F %T') [WARN] rename-window failed for $new_win_id -> $orig_name; trying fallback name" >> "$LOG_FILE"
+        orig_name="${orig_name:-restored-window}"
+        
+        if tmux rename-window -t "$new_win_id" "$orig_name" 2>/dev/null; then
+            log "INFO" "Restored pane $pane -> window '$orig_name' (id: $new_win_id)"
+        else
+            warn "rename-window failed for $new_win_id -> $orig_name"
             tmux rename-window -t "$new_win_id" "${orig_name}-restored" 2>/dev/null
         fi
-        echo "$(date '+%F %T') [INFO] Restored pane $pane -> window '$orig_name' (id: $new_win_id)" >> "$LOG_FILE"
+        # Restore colors if they were set
+        if [[ -n "$bg_color" && -n "$fg_color" ]]; then
+            tmux setw -t "$new_win_id" window-style "fg=$fg_color,bg=$bg_color" 2>/dev/null
+            tmux setw -t "$new_win_id" window-active-style "fg=$fg_color,bg=$bg_color" 2>/dev/null
+            log "INFO" "Restored colors for window $new_win_id: fg=$fg_color bg=$bg_color"
+        fi
     done < "$MAP_FILE"
 
     rm -f "$MAP_FILE"
-    echo "$(date '+%F %T') [INFO] Demultiplex finished; removed mapping file $MAP_FILE" >> "$LOG_FILE"
+    info "Demultiplexed windows restored"
+    log "INFO" "Demultiplex finished; removed mapping file $MAP_FILE"
 
-    if tmux list-windows -t "$session" -F "#{window_name}:#{window_panes}" \
+    # Remove empty sync window
+    if tmux list-windows -t "$session" -F "#{window_name}:#{window_panes}" 2>/dev/null \
        | awk -F: -v w="$target_window" '$1==w && $2==0 { exit 0 } END { if (NR==0) exit 1 }'; then
         tmux kill-window -t "${session}:${target_window}" 2>/dev/null
-        echo "$(date '+%F %T') [INFO] Removed empty $target_window window" >> "$LOG_FILE"
+        log "INFO" "Removed empty $target_window window"
     fi
 }
 
-# Function to show help
-show_help() {
-    cat << EOF
-Usage: $SCRIPT_NAME [OPTIONS]
+# ============================================================================
+# IMPORT / EXPORT / BACKUP
+# ============================================================================
 
-$SCRIPT_NAME is a bash script to manage SSH connections using fzf for selection and tmux for sessions.
+export_sessions() {
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions.json to export" && return 1
 
-Options:
-    -i, --install        Install to ~/.local/bin, add to PATH, add tmux bindings (Ctrl+b C-s, C-g, C-m, C-q)
-    -a, --add            Add a new SSH session interactively to sessions.json
-    -e, --edit           Edit an existing SSH session interactively
-    -r, --remove         Remove SSH sessions interactively (with backup)
-    -s, --sync [--prune] Sync sessions.json with ~/.ssh/config (preserves passwords, groups; --prune removes non-config hosts)
-    -g, --groups         Select and connect to all sessions in chosen group(s)
-    -m, --multiplex      Combine windows into a synchronized pane window (Ctrl+b C-m)
-    -d, --demultiplex    Restore panes from multiplexed window (Ctrl+b C-q)
-    -e, --export         Export sessions.json to a backup file
-    -p, --import         Import sessions from a JSON file (overwrites, backs up existing)
-    -h, --help           Show this help message
-
-Without options:
-    Creates sessions.json from ~/.ssh/config if missing (or sample).
-    Opens fzf to select sessions, connects as tmux windows in current session or "sshmx".
-    Supports keys, encrypted passwords (GPG, use gpg-agent for caching), jump servers, chromaterm, groups.
-    Tmux shortcuts: Ctrl+b C-s (sessions), C-g (groups), C-m (multiplex), C-q (demultiplex).
-
-Sessions stored in ~/.sshmx/sessions.json. Passwords encrypted with GPG (configure ~/.gnupg/gpg-agent.conf, e.g., 'default-cache-ttl 3600'). Logs to ~/.sshmx/sshmx.log.
-
-Dependencies: jq, fzf, tmux, gpg (optional: sshpass, ct/chromaterm, getent).
-EOF
+    local export_file="${1:-sessions-export-$(date +%Y%m%d_%H%M%S).json}"
+    
+    cp "$SESSIONS_FILE" "$export_file"
+    info "Exported sessions to $export_file"
 }
 
-case "$1" in
-    --help|-h)
-        show_help
-        exit 0
-        ;;
-    --install|-i)
-        install_script
-        exit 0
-        ;;
-    --add|-a)
-        add_session
-        exit 0
-        ;;
-    --edit|-e)
-        edit_session
-        exit 0
-        ;;
-    --remove|-r)
-        remove_session
-        exit 0
-        ;;
-    --sync|-s)
-        sync_sessions "$@"
-        exit 0
-        ;;
-    --groups|-g)
-        group_connect
-        ;;
-    --multiplex|-m)
-        multiplex
-        exit 0
-        ;;
-    --demultiplex|-d)
-        demultiplex
-        exit 0
-        ;;
-    --export|-e)
-        export_sessions "$@"
-        exit 0
-        ;;
-    --import|-p)
-        import_sessions "$@"
-        exit 0
-        ;;
-    --migrate-passwords)
-        migrate_passwords
-        exit 0;
-        ;; 
-esac
+import_sessions() {
+    local import_file="${1}"
+    
+    [[ -z "$import_file" ]] && read -p "Enter import filename: " import_file
+    [[ ! -f "$import_file" ]] && error "Import file not found: $import_file" && return 1
 
-# Auto-install if symlink doesn't exist
-if [[ ! -L "$HOME/.local/bin/$SCRIPT_NAME" ]]; then
-    echo "First run detected. Installing $SCRIPT_NAME to PATH and tmux.conf..."
-    install_script
-fi
-
-# Create sessions file if it doesn't exist
-if [[ ! -f "$SESSIONS_FILE" ]]; then
-    temp_json=$(parse_config_to_json)
-    if [[ -n "$temp_json" && -f "$temp_json" ]]; then
-        cp "$temp_json" "$SESSIONS_FILE"
-        rm -f "$temp_json"
+    if ! jq empty "$import_file" 2>/dev/null; then
+        error "Invalid JSON in import file"
+        return 1
     fi
-    num_hosts=$(jq 'keys | length' "$SESSIONS_FILE" 2>/dev/null || echo 0)
-    if [[ "$num_hosts" -eq 0 ]]; then
-        local sample_host="example-host"
-        echo "$(date): No sessions found, adding sample host." >> "$LOG_FILE"
-        jq --arg h "SampleHost" \
-           --arg hn "$sample_host" \
-           --arg u "user" \
-           --arg p "22" \
-           --arg k "~/.ssh/id_ed25519" \
-           --arg j "" \
-           '.[$h] = {host: $hn, user: $u, port: ($p | tonumber), key: $k, password_encrypted: "", jump: $j, group: "", bg_color: "", fg_color: ""}' \
-           "$SESSIONS_FILE" > "${SESSIONS_FILE}.tmp" && mv "${SESSIONS_FILE}.tmp" "$SESSIONS_FILE"
+
+    if [[ -f "$SESSIONS_FILE" ]]; then
+        local backup_file="$BACKUP_DIR/sessions-$(date +%Y%m%d_%H%M%S).json"
+        cp "$SESSIONS_FILE" "$backup_file"
+        info "Backed up current sessions to $backup_file"
     fi
-    echo "Created $SESSIONS_FILE based on ~/.ssh/config (or default sample)."
-    echo "$(date): Generated JSON content:" >> "$LOG_FILE"
-    cat "$SESSIONS_FILE" >> "$LOG_FILE"
-fi
 
-# Check dependencies
-if ! command -v jq &> /dev/null; then
-    echo "Error: jq is required but not installed."
-    exit 1
-fi
-if ! command -v fzf &> /dev/null; then
-    echo "Error: fzf is required but not installed."
-    exit 1
-fi
-if ! command -v tmux &> /dev/null; then
-    echo "Error: tmux is required but not installed."
-    exit 1
-fi
-if ! command -v gpg &> /dev/null; then
-    echo "Error: gpg is required for password encryption but not installed."
-    exit 1
-fi
-if ! command -v ct &> /dev/null; then
-    echo "Warning: chromaterm (ct) not found. Install for colored output (e.g., 'cargo install chromaterm')."
-    USE_CHROMATERM=false
-else
-    USE_CHROMATERM=true
-fi
-
-# Determine tmux session
-if [[ -n "$TMUX" ]]; then
-    TMUX_SESSION=$(tmux display-message -p '#S')
-    echo "$(date): Running inside tmux session '$TMUX_SESSION'." >> "$LOG_FILE"
-else
-    TMUX_SESSION="sshmx"
-    echo "$(date): Running outside tmux. Using session '$TMUX_SESSION'." >> "$LOG_FILE"
-fi
-
-session_exists() {
-    tmux has-session -t "$TMUX_SESSION" 2>/dev/null
+    acquire_lock || return 1
+    cp "$import_file" "$SESSIONS_FILE"
+    release_lock
+    
+    info "Imported sessions from $import_file"
 }
 
-if [[ -z "$TMUX" ]] && ! session_exists; then
-    tmux new-session -d -s "$TMUX_SESSION"
-fi
+auto_backup() {
+    [[ ! -f "$SESSIONS_FILE" ]] && return 0
+    
+    local backup_file="$BACKUP_DIR/auto-backup-$(date +%Y%m%d).json.gz"
+    
+    # Only backup once per day
+    [[ -f "$backup_file" ]] && return 0
+    
+    gzip -c "$SESSIONS_FILE" > "$backup_file"
+    log "INFO" "Auto-backup created: $backup_file"
+    
+    # Keep only last 5 backups
+    ls -t "$BACKUP_DIR"/auto-backup-*.json.gz 2>/dev/null | tail -n +6 | xargs -r rm
+}
 
-if [[ -z "${selected:-}" ]]; then
-    session_names=$(jq -r 'keys[]' "$SESSIONS_FILE")
-    selected=$(echo "$session_names" | fzf --multi --reverse \
-      --prompt="Select SSH sessions: " \
-      --preview "jq -r '.\"{}\" | to_entries[] | \"\(.key): \(.value)\"' \"$SESSIONS_FILE\"" \
-      --preview-window=right:50)
-fi
+# ============================================================================
+# CONNECTION LOGIC
+# ============================================================================
 
-if [[ -z "$selected" ]]; then
-    echo "No session selected."
-    exit 0
-fi
-
-# Process each selected session
-echo "$selected" | while read -r sel; do
-    if [[ -z "$sel" ]]; then
-        continue
-    fi
-
-    user=$(jq -r --arg key "$sel" '.[$key].user // empty' "$SESSIONS_FILE")
-    host=$(jq -r --arg key "$sel" '.[$key].host // empty' "$SESSIONS_FILE")
-    port=$(jq -r --arg key "$sel" '.[$key].port // 22' "$SESSIONS_FILE")
-    key=$(jq -r --arg key "$sel" '.[$key].key // empty' "$SESSIONS_FILE")
-    password_enc=$(jq -r --arg key "$sel" '.[$key].password_encrypted // empty' "$SESSIONS_FILE")
-    jump=$(jq -r --arg key "$sel" '.[$key].jump // empty' "$SESSIONS_FILE")
-    bg_color=$(jq -r --arg key "$sel" '.[$key].bg_color // empty' "$SESSIONS_FILE")
-    fg_color=$(jq -r --arg key "$sel" '.[$key].fg_color // empty' "$SESSIONS_FILE")
-
-    if [[ -n "$key" && ! -f "$key" ]]; then
-        echo "Warning: Key file '$key' not found for '$sel'."
-    fi
-    if [[ "$key" == ~* ]]; then
-        key=$(eval echo "$key")
-    fi
-
-    connect_host="$host"
-    if [[ ! "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        if command -v getent &> /dev/null; then
-            resolved_ip=$(getent hosts "$host" | awk '{print $1}' | head -n1)
-            if [[ -n "$resolved_ip" && "$resolved_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                connect_host="$resolved_ip"
-                echo "Resolved '$host' to IP: $connect_host"
-            else
-                echo "Warning: Could not resolve '$host' to IP, using hostname."
-            fi
-        else
-            echo "Warning: getent not found, using hostname '$host'."
+resolve_host() {
+    local host="$1"
+    
+    # If already an IP, return as-is
+    [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "$host" && return 0
+    
+    # Try to resolve
+    if command -v getent &>/dev/null; then
+        local resolved
+        resolved=$(getent hosts "$host" 2>/dev/null | awk '{print $1}' | head -n1)
+        
+        if [[ -n "$resolved" && "$resolved" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            info "Resolved '$host' to IP: $resolved"
+            echo "$resolved"
+            return 0
         fi
     fi
+    
+    # Fallback to hostname
+    echo "$host"
+}
 
-    if [[ -z "$user" || -z "$connect_host" ]]; then
-        echo "Error: Invalid session data for '$sel'."
-        continue
-    fi
-
-    password=""
-    if [[ -n "$password_enc" && -z "$key" ]]; then
-        password=$(echo "$password_enc" | base64 -d | gpg --decrypt --trust-model always --quiet 2>/dev/null)
-        if [[ $? -ne 0 ]]; then
-            echo "Error: Decryption failed for '$sel'. Check gpg-agent and GPG_TTY."
-            continue
-        fi
-    fi
-
+build_ssh_command() {
+    local session="$1"
+    local session_data
+    session_data=$(jq -r --arg k "$session" '.[$k]' "$SESSIONS_FILE")
+    
+    local user host port key password_enc jump port_forward
+    user=$(echo "$session_data" | jq -r '.user')
+    host=$(echo "$session_data" | jq -r '.host')
+    port=$(echo "$session_data" | jq -r '.port // 22')
+    key=$(echo "$session_data" | jq -r '.key // empty')
+    password_enc=$(echo "$session_data" | jq -r '.password_encrypted // empty')
+    jump=$(echo "$session_data" | jq -r '.jump // empty')
+    port_forward=$(echo "$session_data" | jq -r '.port_forward // empty')
+    
+    [[ -z "$user" || -z "$host" ]] && error "Invalid session data for '$session'" && return 1
+    
+    # Expand key path
+    [[ "$key" == ~* ]] && key=$(eval echo "$key")
+    [[ -n "$key" && ! -f "$key" ]] && warn "Key file '$key' not found for '$session'"
+    
+    local connect_host
+    connect_host=$(resolve_host "$host")
+    
+    local ssh_cmd password=""
+    
     if [[ -n "$jump" ]]; then
-        jump_user=$(jq -r --arg j "$jump" '.[$j].user // empty' "$SESSIONS_FILE")
-        jump_host=$(jq -r --arg j "$jump" '.[$j].host // empty' "$SESSIONS_FILE")
-        jump_port=$(jq -r --arg j "$jump" '.[$j].port // 22' "$SESSIONS_FILE")
-        jump_key=$(jq -r --arg j "$jump" '.[$j].key // empty' "$SESSIONS_FILE")
-        if [[ -z "$jump_user" || -z "$jump_host" ]]; then
-            echo "Error: Invalid jump server '$jump' for '$sel'."
-            continue
-        fi
-
-        temp_config="/tmp/ssh-config-$RANDOM"
-        wrapper="/tmp/ssh-wrapper-$RANDOM.sh"
+        # Jump server configuration
+        local jump_data
+        jump_data=$(jq -r --arg j "$jump" '.[$j]' "$SESSIONS_FILE")
+        
+        [[ "$jump_data" == "null" ]] && error "Jump server '$jump' not found" && return 1
+        
+        local jump_user jump_host jump_port jump_key
+        jump_user=$(echo "$jump_data" | jq -r '.user')
+        jump_host=$(echo "$jump_data" | jq -r '.host')
+        jump_port=$(echo "$jump_data" | jq -r '.port // 22')
+        jump_key=$(echo "$jump_data" | jq -r '.key // empty')
+        
+        [[ -z "$jump_user" || -z "$jump_host" ]] && error "Invalid jump server data" && return 1
+        
+        local temp_config
+        temp_config=$(mktemp)
+        chmod 600 "$temp_config"
+        
         cat > "$temp_config" << EOF
 Host target
     HostName $connect_host
@@ -925,66 +1365,401 @@ Host target
     Port $port
     ProxyJump $jump_user@$jump_host:$jump_port
 EOF
-        if [[ -n "$key" ]]; then
-            echo "    IdentityFile $key" >> "$temp_config"
-        fi
-        if [[ -n "$jump_key" ]]; then
-            echo "Host *
-    IdentityFile $jump_key" >> "$temp_config"
-        fi
-
+        [[ -n "$key" ]] && echo "    IdentityFile $key" >> "$temp_config"
+        [[ -n "$jump_key" ]] && echo -e "\nHost *\n    IdentityFile $jump_key" >> "$temp_config"
+        [[ -n "$port_forward" ]] && echo "    LocalForward $port_forward" >> "$temp_config"
+        
+        local wrapper
+        wrapper=$(mktemp)
+        chmod 700 "$wrapper"
+        
         cat > "$wrapper" << EOF
 #!/bin/bash
 ssh -F $temp_config target
-shred -u $temp_config
-rm -f $wrapper
+rm -f $temp_config $wrapper
 EOF
-        chmod +x "$wrapper"
+        
         ssh_cmd="$wrapper"
-        echo "$(date): Created temp config $temp_config and wrapper $wrapper for jump." >> "$LOG_FILE"
+        log "INFO" "Created jump server config: $temp_config"
     else
+        # Direct connection
         ssh_cmd="ssh $user@$connect_host"
-        if [[ "$port" != "22" ]]; then
-            ssh_cmd="$ssh_cmd -p $port"
-        fi
-        if [[ -n "$key" ]]; then
-            ssh_cmd="$ssh_cmd -i \"$key\""
-        elif [[ -n "$password" ]]; then
-            if command -v sshpass &> /dev/null; then
-                ssh_cmd="sshpass -p '$password' $ssh_cmd"
-                echo "Warning: Using encrypted password for '$sel' - prefer keys. Password exposed in process list."
+        [[ "$port" != "22" ]] && ssh_cmd="$ssh_cmd -p $port"
+        [[ -n "$key" ]] && ssh_cmd="$ssh_cmd -i \"$key\""
+        [[ -n "$port_forward" ]] && ssh_cmd="$ssh_cmd -L $port_forward"
+        
+        if [[ -n "$password_enc" && -z "$key" ]]; then
+            password=$(decrypt_password "$password_enc") || return 1
+            
+            if command -v sshpass &>/dev/null; then
+                # Create a temporary password file for sshpass
+                local pw_file
+                pw_file=$(mktemp)
+                chmod 600 "$pw_file"
+                echo "$password" > "$pw_file"
+                ssh_cmd="sshpass -f '$pw_file' $ssh_cmd; rm -f '$pw_file'"
+                warn "Using password for '$session' - prefer SSH keys"
             else
-                echo "Error: sshpass not installed, cannot use password for '$sel'."
-                continue
+                error "sshpass not installed, cannot use password for '$session'"
+                return 1
             fi
-        else
-            echo "No key or encrypted password for '$sel'; SSH will prompt if required."
         fi
     fi
-
-    if [[ "$USE_CHROMATERM" == true ]]; then
+    
+    # Add chromaterm if available
+    if command -v ct &>/dev/null; then
         ssh_cmd="ct $ssh_cmd"
     fi
+    
+    echo "$ssh_cmd"
+}
 
-    base_name="$sel"
-    window_name="$base_name"
-    if tmux list-windows -t "$TMUX_SESSION" | grep -qE "^[0-9]+: $base_name"; then
-        idx=2
-        while tmux list-windows -t "$TMUX_SESSION" | grep -qE "^[0-9]+: ${base_name}-${idx}\b"; do
-            ((idx++))
-        done
+connect_session() {
+    local session="$1"
+    local tmux_session="$2"
+    
+    local ssh_cmd
+    ssh_cmd=$(build_ssh_command "$session") || return 1
+    
+    local session_data
+    session_data=$(jq -r --arg k "$session" '.[$k]' "$SESSIONS_FILE")
+    
+    local bg_color fg_color
+    bg_color=$(echo "$session_data" | jq -r '.bg_color // empty')
+    fg_color=$(echo "$session_data" | jq -r '.fg_color // empty')
+    
+    # Generate unique window name
+    local base_name="$session"
+    local window_name="$base_name"
+    local idx=2
+    
+    while tmux list-windows -t "$tmux_session" 2>/dev/null | grep -qE "^[0-9]+: ${window_name}\$"; do
         window_name="${base_name}-${idx}"
-    fi
-
-    tmux new-window -t "$TMUX_SESSION" -n "$window_name" "$ssh_cmd"
+        ((idx++))
+    done
+    
+    # Create window
+    tmux new-window -t "$tmux_session" -n "$window_name" "$ssh_cmd"
+    
+    # Apply colors
     if [[ -n "$bg_color" && -n "$fg_color" ]]; then
-        tmux setw -t "$TMUX_SESSION:$window_name" window-style "fg=$fg_color,bg=$bg_color"
-        tmux setw -t "$TMUX_SESSION:$window_name" window-active-style "fg=$fg_color,bg=$bg_color"
+        tmux setw -t "$tmux_session:$window_name" window-style "fg=$fg_color,bg=$bg_color"
+        tmux setw -t "$tmux_session:$window_name" window-active-style "fg=$fg_color,bg=$bg_color"
     fi
+    
+    # Log connection
+    log_connection "$session"
+    
+    log "INFO" "Connected to $session in window $window_name"
+}
 
-    unset password
-done
+connect_multiple() {
+    local selected="$1"
+    local tmux_session="$2"
+    
+    while IFS= read -r session; do
+        [[ -z "$session" ]] && continue
+        connect_session "$session" "$tmux_session" || warn "Failed to connect to '$session'"
+    done <<< "$selected"
+}
 
-if [[ -z "$TMUX" ]]; then
-    tmux attach-session -t "$TMUX_SESSION"
-fi
+# ============================================================================
+# HELP
+# ============================================================================
+
+show_help() {
+    cat << 'EOF'
+Usage: sshmx [OPTIONS]
+
+Enhanced SSH session manager with tmux integration
+
+Session Management:
+    -a, --add               Add new SSH session
+    -e, --edit              Edit existing session
+    -r, --remove            Remove sessions
+    --bulk-edit             Edit multiple sessions at once
+    
+Configuration:
+    -i, --install           Install to PATH and configure tmux
+    -s, --sync [--prune]    Sync with ~/.ssh/config
+    --export-config [file]  Export to SSH config format
+    
+Groups & Organization:
+    -g, --groups            Connect to all sessions in group(s)
+    --favorites             Show and connect to favorite sessions
+    --add-favorite          Add sessions to favorites
+    
+Templates:
+    -t, --templates         List and use templates
+    --add-template          Create new session template
+    --use-template          Create session from template
+    
+History:
+    -h, --history           Show connection history
+    
+Health Checks:
+    --check                 Check selected sessions
+    --check-all             Check all sessions
+    
+Tmux Operations:
+    -m, --multiplex         Combine windows into synchronized pane
+    -d, --demultiplex       Restore multiplexed windows
+    
+Import/Export:
+    --export [file]         Export sessions.json
+    --import [file]         Import sessions.json
+    
+Other:
+    --help                  Show this help message
+
+Tmux Keybindings (active when sshmx is running):
+    Ctrl+Alt+s              Select sessions
+    Ctrl+Alt+g              Select groups
+    Ctrl+Alt+m              Multiplex windows
+    Ctrl+Alt+d              Demultiplex
+    Ctrl+Alt+h              Connection history
+    Ctrl+Alt+t              Templates
+    Ctrl+Alt+c              Health check all
+
+Permanent Tmux Bindings (after installation):
+    prefix+S                Select sessions
+    prefix+G                Select groups
+    prefix+M                Multiplex windows
+    prefix+D                Demultiplex
+    prefix+H                Connection history
+
+Session Storage:
+    ~/.sshmx/sessions.json      Session configurations
+    ~/.sshmx/templates.json     Session templates
+    ~/.sshmx/history.json       Connection history
+    ~/.sshmx/backups/           Automatic backups
+    ~/.sshmx/sshmx.log          Activity log
+
+Features:
+    - GPG-encrypted passwords (prefer SSH keys)
+    - Jump server (ProxyJump) support
+    - Port forwarding configuration
+    - Session groups and favorites
+    - Connection history tracking
+    - Health checks for hosts
+    - Synchronized input across multiple hosts
+    - Session templates for quick setup
+    - Custom window colors per session
+    - Automatic daily backups
+
+Dependencies:
+    Required: jq, fzf, tmux, gpg
+    Optional: sshpass, chromaterm (ct), getent, nc
+
+Examples:
+    sshmx                       # Select and connect to sessions
+    sshmx --add                 # Add new session
+    sshmx --groups              # Connect to all hosts in group(s)
+    sshmx --sync --prune        # Sync with SSH config, remove stale
+    sshmx --check-all           # Health check all configured sessions
+    sshmx --multiplex           # Combine windows for synchronized input
+    sshmx --history             # Connect from recent history
+
+Configuration:
+    Configure GPG agent for password caching:
+        echo "default-cache-ttl 3600" >> ~/.gnupg/gpg-agent.conf
+        gpgconf --kill gpg-agent
+
+EOF
+}
+
+# ============================================================================
+# MAIN LOGIC
+# ============================================================================
+
+main() {
+    setup_gpg_tty
+    check_dependencies || exit 1
+    initialize_data_files
+    auto_backup
+    
+    # Load temporary tmux keybindings
+    load_tmux_keybindings
+    trap unload_tmux_keybindings EXIT
+    
+    local selected=""
+    
+    # Parse arguments
+    case "${1:-}" in
+        --help)
+            show_help
+            exit 0
+            ;;
+        -i|--install)
+            install_script
+            exit 0
+            ;;
+        -a|--add)
+            add_session
+            exit 0
+            ;;
+        -e|--edit)
+            edit_session
+            exit 0
+            ;;
+        -r|--remove)
+            remove_session
+            exit 0
+            ;;
+        --bulk-edit)
+            bulk_edit
+            exit 0
+            ;;
+        -s|--sync)
+            sync_sessions "${2:-}"
+            exit 0
+            ;;
+        --export-config)
+            export_to_ssh_config "${2:-}"
+            exit 0
+            ;;
+        -g|--groups)
+            selected=$(group_connect)
+            ;;
+        --favorites)
+            selected=$(show_favorites)
+            ;;
+        --add-favorite)
+            add_favorite
+            exit 0
+            ;;
+        -t|--templates)
+            list_templates
+            exit 0
+            ;;
+        --add-template)
+            add_template
+            exit 0
+            ;;
+        --use-template)
+            use_template
+            exit 0
+            ;;
+        -h|--history)
+            selected=$(show_history)
+            ;;
+        --check)
+            interactive_health_check
+            exit 0
+            ;;
+        --check-all)
+            check_all_sessions
+            exit 0
+            ;;
+        -m|--multiplex)
+            # Determine tmux session
+            local tmux_session
+            if [[ -n "${TMUX:-}" ]]; then
+                tmux_session=$(tmux display-message -p '#S')
+            else
+                tmux_session="$DEFAULT_SESSION"
+            fi
+            multiplex "$tmux_session"
+            exit 0
+            ;;
+        -d|--demultiplex)
+            local tmux_session
+            if [[ -n "${TMUX:-}" ]]; then
+                tmux_session=$(tmux display-message -p '#S')
+            else
+                tmux_session="$DEFAULT_SESSION"
+            fi
+            demultiplex "$tmux_session"
+            exit 0
+            ;;
+        --export)
+            export_sessions "${2:-}"
+            exit 0
+            ;;
+        --import)
+            import_sessions "${2:-}"
+            exit 0
+            ;;
+        "")
+            # Default: interactive session selection
+            ;;
+        *)
+            error "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+    
+    # Auto-install on first run
+    if [[ ! -L "$HOME/.local/bin/$SCRIPT_NAME" ]]; then
+        info "First run detected. Installing..."
+        install_script
+        info ""
+        info "Installation complete. Continuing with session selection..."
+        echo ""
+    fi
+    
+    # Interactive session selection if not already selected
+    if [[ -z "$selected" ]]; then
+        [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions.json found. Run --sync or --add first." && exit 1
+        
+        local session_names
+        session_names=$(jq -r 'keys[]' "$SESSIONS_FILE")
+        
+        [[ -z "$session_names" ]] && error "No sessions configured. Run --add or --sync." && exit 1
+        
+        # Enhanced preview with more details
+        selected=$(echo "$session_names" | fzf --multi --reverse \
+  --prompt="Select SSH sessions: " \
+  --header="Tab: multi-select | Enter: connect" \
+  --preview "jq -r --arg k '{}' '
+    .[\$k] |
+    \"Session: \" + \$k,
+    \"\",
+    \"Host: \" + (.host // \"-\"),
+    \"User: \" + (.user // \"-\"),
+    \"Port: \" + (.port | tostring),
+    \"Key: \" + (.key // \"-\"),
+    \"Jump: \" + (.jump // \"-\"),
+    \"Group: \" + (.group // \"-\"),
+    \"\",
+    \"Description: \" + (.description // \"-\"),
+    \"Tags: \" + (.tags // \"-\"),
+    \"\",
+    \"Colors: \n  - Foreground: \" + (.fg_color // \"-\") + \" \n  - Background: \" + (.bg_color // \"-\")
+  ' \"$SESSIONS_FILE\"" \
+  --preview-window=right:50:wrap)
+
+    fi
+    
+    [[ -z "$selected" ]] && info "No session selected" && exit 0
+    
+    # Determine tmux session
+    local tmux_session
+    if [[ -n "${TMUX:-}" ]]; then
+        tmux_session=$(tmux display-message -p '#S')
+        log "INFO" "Running inside tmux session '$tmux_session'"
+    else
+        tmux_session="$DEFAULT_SESSION"
+        log "INFO" "Creating/using tmux session '$tmux_session'"
+        
+        if ! tmux has-session -t "$tmux_session" 2>/dev/null; then
+            tmux new-session -d -s "$tmux_session"
+        fi
+    fi
+    
+    # Connect to selected sessions
+    connect_multiple "$selected" "$tmux_session"
+    
+    # Attach to session if not already in tmux
+    if [[ -z "${TMUX:-}" ]]; then
+        info "Attaching to tmux session '$tmux_session'..."
+        exec tmux attach-session -t "$tmux_session"
+    fi
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+main "$@"
