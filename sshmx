@@ -284,25 +284,15 @@ install_script() {
     # Add bash completion
     if [[ -f "$HOME/.bashrc" ]] && ! grep -q "^complete -F _sshmx sshmx" "$HOME/.bashrc" 2>/dev/null; then
         cat >> "$HOME/.bashrc" << 'EOF'
-
 # sshmx bash completion
-_sshmx() {
-    local cur prev opts
-    COMPREPLY=()
-    cur="${COMP_WORDS[COMP_CWORD]}"
-    prev="${COMP_WORDS[COMP_CWORD-1]}"
-    opts="--install --add --edit --remove --sync --groups --export --import --multiplex --demultiplex --history --templates --check --health --favorites --bulk-edit --help"
-
-    if [[ ${cur} == -* ]] ; then
-        COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
-        return 0
-    fi
-}
-complete -F _sshmx sshmx
+if command -v sshmx &>/dev/null; then
+    source <(sshmx --completion)
+fi
 EOF
         info "Bash completion added to ~/.bashrc"
+    else
+        info "Bash completion already exists in ~/.bashrc"
     fi
-
     # Setup tmux configuration
     setup_permanent_tmux_config
 
@@ -1088,6 +1078,46 @@ group_connect() {
     echo "$selected"
 }
 
+tag_connect() {
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions found" && return 1
+    
+    # Extract all unique tags from sessions
+    local all_tags
+    all_tags=$(jq -r '.[] | .tags // empty' "$SESSIONS_FILE" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | sort -u)
+    
+    [[ -z "$all_tags" ]] && error "No tags defined in any session" && return 1
+    
+    # Let user select tags
+    local selected_tags
+    selected_tags=$(echo "$all_tags" | fzf --multi --reverse --prompt="Select tags to connect: " \
+        --header="Tab: multi-select | Enter: connect to all sessions with selected tags")
+    
+    [[ -z "$selected_tags" ]] && info "No tags selected" && return 0
+    
+    # Find all sessions that have ANY of the selected tags
+    local selected=""
+    while IFS= read -r tag; do
+        if [[ -n "$tag" ]]; then
+            local tag_sessions
+            # Match sessions where tags field contains the tag (comma-separated)
+            tag_sessions=$(jq -r --arg t "$tag" 'to_entries[] | 
+                select(.value.tags // "" | split(",") | map(gsub("^[[:space:]]+|[[:space:]]+$";"")) | index($t)) | 
+                .key' "$SESSIONS_FILE")
+            selected="${selected}${selected:+$'\n'}${tag_sessions}"
+        fi
+    done <<< "$selected_tags"
+    
+    # Remove duplicates
+    selected=$(echo "$selected" | sort -u | grep -v '^$')
+    
+    [[ -z "$selected" ]] && error "No sessions found with selected tags" && return 1
+    
+    info "Found $(echo "$selected" | wc -l) session(s) with selected tag(s)"
+    
+    # Return selected for main connection logic
+    echo "$selected"
+}
+
 # ============================================================================
 # MULTIPLEX / DEMULTIPLEX
 # ============================================================================
@@ -1122,28 +1152,34 @@ multiplex() {
     [[ -z "$first_id" ]] && error "Unable to parse first window id" && return 1
 
     mapfile -t first_panes < <(tmux list-panes -t "$first_id" -F "#{pane_id}" 2>/dev/null || true)
+
     for p in "${first_panes[@]}"; do
         local bg_color fg_color
-        # Get colors from window-style option
-        local style=$(tmux show-window-options -t "$first_id" -v window-style 2>/dev/null || echo "")
-        if [[ -n "$style" ]]; then
-            bg_color=$(echo "$style" | grep -o 'bg=[^,}]*' | cut -d= -f2)
-            fg_color=$(echo "$style" | grep -o 'fg=[^,}]*' | cut -d= -f2)
-        fi
-        [[ -z "$bg_color" ]] && bg_color="default"
-        [[ -z "$fg_color" ]] && fg_color="default"
-        printf "%s|%s|%s|%s\n" "$p" "$first_name" "$bg_color" "$fg_color" >> "$MAP_FILE"
-        log "DEBUG" "MAPPED $p -> $first_name (colors: fg=$fg_color bg=$bg_color)"
+        # Get colors from sessions.json based on window name
+        bg_color=$(jq -r --arg name "$first_name" '.[$name].bg_color // "default"' "$SESSIONS_FILE" 2>/dev/null)
+        fg_color=$(jq -r --arg name "$first_name" '.[$name].fg_color // "default"' "$SESSIONS_FILE" 2>/dev/null)
+        
+        # Debug: show what we got
+        echo "DEBUG: first_name=$first_name, bg=$bg_color, fg=$fg_color" >&2
+        
+        echo "$p|$first_name|$bg_color|$fg_color" >> "$MAP_FILE"
+        log "INFO" "MAPPED $p -> $first_name (colors: fg=$fg_color bg=$bg_color)"
     done
 
     tmux rename-window -t "$first_id" "$target_window"
     log "INFO" "Renamed window id $first_id -> $target_window"
 
-    for (( i=1; i<${#windows[@]}; i++ )); do
-        local w="${windows[$i]}"
-        local win_id=$(echo "$w" | cut -d: -f4)
-        local win_name=$(echo "$w" | cut -d: -f3)
-        log "INFO" "Processing window id $win_id (name: $win_name)"
+    for p in "${panes[@]}"; do
+        local bg_color fg_color
+        # Get colors from sessions.json based on window name
+        bg_color=$(jq -r --arg name "$win_name" '.[$name].bg_color // "default"' "$SESSIONS_FILE" 2>/dev/null)
+        fg_color=$(jq -r --arg name "$win_name" '.[$name].fg_color // "default"' "$SESSIONS_FILE" 2>/dev/null)
+        
+        # Debug: show what we got
+        echo "DEBUG: win_name=$win_name, bg=$bg_color, fg=$fg_color" >&2
+        
+        echo "$p|$win_name|$bg_color|$fg_color" >> "$MAP_FILE"
+        log "INFO" "MAPPED $p -> $win_name (colors: fg=$fg_color bg=$bg_color)"
 
         mapfile -t panes < <(tmux list-panes -t "$win_id" -F "#{pane_id}" 2>/dev/null || true)
         
@@ -1466,6 +1502,52 @@ connect_multiple() {
 # ============================================================================
 # HELP
 # ============================================================================
+# Function to generate bash completion script
+generate_completion() {
+    cat << 'EOF'
+# sshmx bash completion
+_sshmx() {
+    local cur prev opts sessions groups templates tags
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    
+    # Main options
+    opts="--install --add --edit --remove --sync --groups --tags --export --import 
+          --multiplex --demultiplex --history --templates --add-template --use-template 
+          --check --check-all --favorites --add-favorite --bulk-edit --export-config 
+          --completion --help -i -a -e -r -s -g -t -m -d -h"
+    
+    # If previous word is a flag that takes arguments
+    case "${prev}" in
+        --export|--import|--export-config)
+            # Complete with filenames
+            COMPREPLY=( $(compgen -f -- ${cur}) )
+            return 0
+            ;;
+        --sync)
+            # Offer --prune as sub-option
+            COMPREPLY=( $(compgen -W "--prune" -- ${cur}) )
+            return 0
+            ;;
+    esac
+    
+    # If current word starts with -, show options
+    if [[ ${cur} == -* ]] ; then
+        COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
+        return 0
+    fi
+    
+    # Otherwise, complete with session names
+    if [[ -f "$HOME/.sshmx/sessions.json" ]]; then
+        sessions=$(jq -r 'keys[]' "$HOME/.sshmx/sessions.json" 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${sessions}" -- ${cur}) )
+    fi
+}
+
+complete -F _sshmx sshmx
+EOF
+}
 
 show_help() {
     cat << 'EOF'
@@ -1486,6 +1568,7 @@ Configuration:
     
 Groups & Organization:
     -g, --groups            Connect to all sessions in group(s)
+    --tags                  Connect to all sessions with selected tag(s)
     --favorites             Show and connect to favorite sessions
     --add-favorite          Add sessions to favorites
     
@@ -1510,6 +1593,7 @@ Import/Export:
     --import [file]         Import sessions.json
     
 Other:
+    --completion            Generate bash completion script
     --help                  Show this help message
 
 Tmux Keybindings (active when sshmx is running):
@@ -1590,6 +1674,10 @@ main() {
             show_help
             exit 0
             ;;
+        --completion)
+            generate_completion
+            exit 0
+            ;;
         -i|--install)
             install_script
             exit 0
@@ -1620,6 +1708,9 @@ main() {
             ;;
         -g|--groups)
             selected=$(group_connect)
+            ;;
+        --tags|-t)
+            selected=$(tag_connect)
             ;;
         --favorites)
             selected=$(show_favorites)
