@@ -177,14 +177,6 @@ load_tmux_keybindings() {
     if [[ -n "${TMUX:-}" ]]; then
         create_tmux_keybindings
         tmux source-file "$TMUX_KEYBINDINGS_FILE" 2>/dev/null || warn "Could not load tmux keybindings"
-        info "Loaded temporary tmux keybindings (active only while sshmx is running)"
-        info "  Ctrl+Alt+s: Select sessions"
-        info "  Ctrl+Alt+g: Select groups"
-        info "  Ctrl+Alt+m: Multiplex windows"
-        info "  Ctrl+Alt+d: Demultiplex"
-        info "  Ctrl+Alt+h: Connection history"
-        info "  Ctrl+Alt+t: Templates"
-        info "  Ctrl+Alt+c: Health check all"
     fi
 }
 
@@ -1457,27 +1449,29 @@ connect_session() {
     local ssh_cmd
     ssh_cmd=$(build_ssh_command "$session") || return 1
     
-    local session_data
-    session_data=$(jq -r --arg k "$session" '.[$k]' "$SESSIONS_FILE")
-    
+    # Get colors from sessions.json using the ORIGINAL session name
     local bg_color fg_color
-    bg_color=$(echo "$session_data" | jq -r '.bg_color // empty')
-    fg_color=$(echo "$session_data" | jq -r '.fg_color // empty')
+    bg_color=$(jq -r --arg key "$session" '.[$key].bg_color // empty' "$SESSIONS_FILE")
+    fg_color=$(jq -r --arg key "$session" '.[$key].fg_color // empty' "$SESSIONS_FILE")
     
-    # Generate unique window name
+    # Generate unique window name using your original logic
     local base_name="$session"
     local window_name="$base_name"
     local idx=2
     
-    while tmux list-windows -t "$tmux_session" 2>/dev/null | grep -qE "^[0-9]+: ${window_name}\$"; do
+    # Check if a window with this name already exists
+    if tmux list-windows -t "$tmux_session" 2>/dev/null | grep -qE "^[0-9]+: $base_name"; then
+        # If it exists, find the next available suffix
+        while tmux list-windows -t "$tmux_session" 2>/dev/null | grep -qE "^[0-9]+: ${base_name}-${idx}\b"; do
+            ((idx++))
+        done
         window_name="${base_name}-${idx}"
-        ((idx++))
-    done
+    fi
     
-    # Create window
+    # Create the new window
     tmux new-window -t "$tmux_session" -n "$window_name" "$ssh_cmd"
     
-    # Apply colors
+    # Apply colors if provided (using colors from original session name)
     if [[ -n "$bg_color" && -n "$fg_color" ]]; then
         tmux setw -t "$tmux_session:$window_name" window-style "fg=$fg_color,bg=$bg_color"
         tmux setw -t "$tmux_session:$window_name" window-active-style "fg=$fg_color,bg=$bg_color"
