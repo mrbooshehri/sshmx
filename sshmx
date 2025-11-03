@@ -1703,7 +1703,7 @@ main() {
         -g|--groups)
             selected=$(group_connect)
             ;;
-        --tags|-t)
+        --tags)
             selected=$(tag_connect)
             ;;
         --favorites)
@@ -1713,7 +1713,7 @@ main() {
             add_favorite
             exit 0
             ;;
-        -t|--templates)
+        --templates)
             list_templates
             exit 0
             ;;
