@@ -1665,58 +1665,51 @@ multiplex() {
     
     [[ -z "$first_id" ]] && error "Unable to parse first window id" && return 1
 
+    # Process first window's panes
     mapfile -t first_panes < <(tmux list-panes -t "$first_id" -F "#{pane_id}" 2>/dev/null || true)
-
     for p in "${first_panes[@]}"; do
         local bg_color fg_color
         # Get colors from sessions.json based on window name
         bg_color=$(jq -r --arg name "$first_name" '.[$name].bg_color // "default"' "$SESSIONS_FILE" 2>/dev/null)
         fg_color=$(jq -r --arg name "$first_name" '.[$name].fg_color // "default"' "$SESSIONS_FILE" 2>/dev/null)
         
-        # Debug: show what we got
-        echo "DEBUG: first_name=$first_name, bg=$bg_color, fg=$fg_color" >&2
-        
-        echo "$p|$first_name|$bg_color|$fg_color" >> "$MAP_FILE"
+        printf "%s|%s|%s|%s\n" "$p" "$first_name" "$bg_color" "$fg_color" >> "$MAP_FILE"
         log "INFO" "MAPPED $p -> $first_name (colors: fg=$fg_color bg=$bg_color)"
     done
 
+    # Rename first window to target
     tmux rename-window -t "$first_id" "$target_window"
     log "INFO" "Renamed window id $first_id -> $target_window"
 
-    for p in "${panes[@]}"; do
-        local bg_color fg_color
-        # Get colors from sessions.json based on window name
-        bg_color=$(jq -r --arg name "$win_name" '.[$name].bg_color // "default"' "$SESSIONS_FILE" 2>/dev/null)
-        fg_color=$(jq -r --arg name "$win_name" '.[$name].fg_color // "default"' "$SESSIONS_FILE" 2>/dev/null)
-        
-        # Debug: show what we got
-        echo "DEBUG: win_name=$win_name, bg=$bg_color, fg=$fg_color" >&2
-        
-        echo "$p|$win_name|$bg_color|$fg_color" >> "$MAP_FILE"
-        log "INFO" "MAPPED $p -> $win_name (colors: fg=$fg_color bg=$bg_color)"
+    # Process remaining windows
+    for (( i=1; i<${#windows[@]}; i++ )); do
+        local w="${windows[$i]}"
+        local win_id=$(echo "$w" | cut -d: -f4)
+        local win_name=$(echo "$w" | cut -d: -f3)
+        log "INFO" "Processing window id $win_id (name: $win_name)"
 
         mapfile -t panes < <(tmux list-panes -t "$win_id" -F "#{pane_id}" 2>/dev/null || true)
         
         [[ ${#panes[@]} -eq 0 ]] && warn "No panes found for window id $win_id" && continue
 
+        # Process each pane in this window
         for p in "${panes[@]}"; do
             local bg_color fg_color
-            # Get colors from window-style option
-            local style=$(tmux show-window-options -t "$win_id" -v window-style 2>/dev/null || echo "")
-            if [[ -n "$style" ]]; then
-                bg_color=$(echo "$style" | grep -o 'bg=[^,}]*' | cut -d= -f2)
-                fg_color=$(echo "$style" | grep -o 'fg=[^,}]*' | cut -d= -f2)
-            fi
-            [[ -z "$bg_color" ]] && bg_color="default"
-            [[ -z "$fg_color" ]] && fg_color="default"
+            # Get colors from sessions.json based on window name
+            bg_color=$(jq -r --arg name "$win_name" '.[$name].bg_color // "default"' "$SESSIONS_FILE" 2>/dev/null)
+            fg_color=$(jq -r --arg name "$win_name" '.[$name].fg_color // "default"' "$SESSIONS_FILE" 2>/dev/null)
+            
             printf "%s|%s|%s|%s\n" "$p" "$win_name" "$bg_color" "$fg_color" >> "$MAP_FILE"
-            log "DEBUG" "MAPPED $p -> $win_name (colors: fg=$fg_color bg=$bg_color)"
+            log "INFO" "MAPPED $p -> $win_name (colors: fg=$fg_color bg=$bg_color)"
             
             if tmux join-pane -s "$p" -t "${session}:${target_window}" 2>/dev/null; then
                 log "INFO" "Joined pane $p into ${session}:${target_window}"
             else
                 error "join-pane failed for pane $p"
             fi
+            
+            # Small delay for tmux state consistency
+            sleep 0.03
         done
         
         tmux kill-window -t "$win_id" 2>/dev/null
@@ -1766,8 +1759,9 @@ demultiplex() {
             warn "rename-window failed for $new_win_id -> $orig_name"
             tmux rename-window -t "$new_win_id" "${orig_name}-restored" 2>/dev/null
         fi
-        # Restore colors if they were set
-        if [[ -n "$bg_color" && -n "$fg_color" ]]; then
+        
+        # Restore colors if they were set and not "default"
+        if [[ -n "$bg_color" && "$bg_color" != "default" && -n "$fg_color" && "$fg_color" != "default" ]]; then
             tmux setw -t "$new_win_id" window-style "fg=$fg_color,bg=$bg_color" 2>/dev/null
             tmux setw -t "$new_win_id" window-active-style "fg=$fg_color,bg=$bg_color" 2>/dev/null
             log "INFO" "Restored colors for window $new_win_id: fg=$fg_color bg=$bg_color"
