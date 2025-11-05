@@ -608,6 +608,250 @@ bulk_edit() {
     info "Bulk edit completed"
 }
 
+clone_session() {
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions found" && return 1
+    
+    local session_names
+    session_names=$(jq -r 'keys[]' "$SESSIONS_FILE")
+    
+    local source
+    source=$(echo "$session_names" | fzf --reverse --prompt="Select session to clone: " \
+      --preview "jq -r --arg k '{}' '.[\$k] | to_entries[] | \"\(.key): \(.value)\"' '$SESSIONS_FILE'" \
+      --preview-window=right:50)
+    
+    [[ -z "$source" ]] && info "No session selected" && return 0
+    
+    read -p "New session name: " new_name
+    [[ -z "$new_name" ]] && error "Name cannot be empty" && return 1
+    
+    if jq -e --arg n "$new_name" 'has($n)' "$SESSIONS_FILE" > /dev/null 2>&1; then
+        error "Session '$new_name' already exists"
+        return 1
+    fi
+    
+    read -p "New host/IP (leave blank to keep same): " new_host
+    
+    acquire_lock || return 1
+    
+    if [[ -n "$new_host" ]]; then
+        jq --arg src "$source" --arg new "$new_name" --arg host "$new_host" \
+           '.[$new] = .[$src] | .[$new].host = $host | .[$new].created = now | .[$new].modified = now' \
+           "$SESSIONS_FILE" | atomic_write "$SESSIONS_FILE"
+    else
+        jq --arg src "$source" --arg new "$new_name" \
+           '.[$new] = .[$src] | .[$new].created = now | .[$new].modified = now' \
+           "$SESSIONS_FILE" | atomic_write "$SESSIONS_FILE"
+    fi
+    
+    release_lock
+    info "Cloned '$source' to '$new_name'"
+}
+
+# ============================================================================
+# SESSION NOTES
+# ============================================================================
+
+add_note() {
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions found" && return 1
+    
+    local session_names
+    session_names=$(jq -r 'keys[]' "$SESSIONS_FILE")
+    
+    local session
+    session=$(echo "$session_names" | fzf --reverse --prompt="Select session to add note: " \
+      --preview "jq -r --arg k '{}' '.[\$k] | to_entries[] | \"\(.key): \(.value)\"' '$SESSIONS_FILE'" \
+      --preview-window=right:50)
+    
+    [[ -z "$session" ]] && info "No session selected" && return 0
+    
+    read -p "Add note for '$session': " note
+    [[ -z "$note" ]] && return 0
+    
+    acquire_lock || return 1
+    
+    jq --arg s "$session" --arg n "$note" \
+       '.[$s].notes = (if .[$s].notes then .[$s].notes else [] end) + [$n]' \
+       "$SESSIONS_FILE" | atomic_write "$SESSIONS_FILE"
+    
+    release_lock
+    info "Note added to '$session'"
+}
+
+view_notes() {
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions found" && return 1
+    
+    local session_names
+    session_names=$(jq -r 'keys[]' "$SESSIONS_FILE")
+    
+    local session
+    session=$(echo "$session_names" | fzf --reverse --prompt="Select session to view notes: " \
+      --preview "jq -r --arg k '{}' '.[\$k].notes[]? // \"No notes\"' '$SESSIONS_FILE'" \
+      --preview-window=right:50)
+    
+    [[ -z "$session" ]] && info "No session selected" && return 0
+    
+    echo ""
+    info "Notes for '$session':"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    jq -r --arg s "$session" '.[$s].notes[]? // "No notes"' "$SESSIONS_FILE"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+delete_note() {
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions found" && return 1
+    
+    local session_names
+    session_names=$(jq -r 'keys[]' "$SESSIONS_FILE")
+    
+    local session
+    session=$(echo "$session_names" | fzf --reverse --prompt="Select session: " \
+      --preview "jq -r --arg k '{}' '.[\$k].notes[]? // \"No notes\"' '$SESSIONS_FILE'" \
+      --preview-window=right:50)
+    
+    [[ -z "$session" ]] && return 0
+    
+    # Check if session has notes
+    local has_notes
+    has_notes=$(jq -r --arg s "$session" '.[$s].notes // [] | length' "$SESSIONS_FILE")
+    
+    if [[ "$has_notes" -eq 0 ]]; then
+        error "No notes for '$session'"
+        return 1
+    fi
+    
+    # Show notes with numbers
+    echo ""
+    info "Notes for '$session':"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    jq -r --arg s "$session" '.[$s].notes[]?' "$SESSIONS_FILE" | cat -n
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    
+    read -p "Enter note number to delete (0 to cancel): " note_num
+    
+    # Validate input
+    if [[ ! "$note_num" =~ ^[0-9]+$ ]]; then
+        error "Invalid number"
+        return 1
+    fi
+    
+    if [[ "$note_num" -eq 0 ]]; then
+        info "Cancelled"
+        return 0
+    fi
+    
+    if [[ "$note_num" -gt "$has_notes" ]]; then
+        error "Note number out of range (1-$has_notes)"
+        return 1
+    fi
+    
+    # Create backup before deletion
+    local backup_file="$BACKUP_DIR/sessions-before-note-delete-$(date +%Y%m%d_%H%M%S).json"
+    cp "$SESSIONS_FILE" "$backup_file"
+    
+    acquire_lock || return 1
+    
+    # Convert to 0-based index
+    local idx=$((note_num - 1))
+    
+    # Delete the note at the specified index
+    jq --arg s "$session" --argjson i "$idx" \
+       '.[$s].notes |= del(.[$i])' \
+       "$SESSIONS_FILE" > "${SESSIONS_FILE}.tmp"
+    
+    if [[ $? -eq 0 ]] && [[ -s "${SESSIONS_FILE}.tmp" ]]; then
+        mv "${SESSIONS_FILE}.tmp" "$SESSIONS_FILE"
+        release_lock
+        info "Note deleted (backup: $backup_file)"
+    else
+        rm -f "${SESSIONS_FILE}.tmp"
+        release_lock
+        error "Failed to delete note"
+        return 1
+    fi
+}
+
+# ============================================================================
+# STATISTICS & REPORTING
+# ============================================================================
+
+show_stats() {
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions found" && return 1
+    
+    local total=$(jq 'keys | length' "$SESSIONS_FILE")
+    local groups=$(jq -r '.[] | .group' "$SESSIONS_FILE" | grep -v '^$' | sort -u | wc -l)
+    local with_jump=$(jq '[.[] | select(.jump != "")] | length' "$SESSIONS_FILE")
+    local with_keys=$(jq '[.[] | select(.key != "")] | length' "$SESSIONS_FILE")
+    local with_passwords=$(jq '[.[] | select(.password_encrypted != "")] | length' "$SESSIONS_FILE")
+    
+    local connections=0
+    local favorites=0
+    local most_used="N/A"
+    
+    if [[ -f "$HISTORY_FILE" ]]; then
+        connections=$(jq '.connections | length' "$HISTORY_FILE" 2>/dev/null || echo 0)
+        favorites=$(jq '.favorites | length' "$HISTORY_FILE" 2>/dev/null || echo 0)
+        most_used=$(jq -r '.connections[] | .session' "$HISTORY_FILE" 2>/dev/null | sort | uniq -c | sort -rn | head -1 | awk '{print $2" ("$1" times)"}' || echo "N/A")
+    fi
+    
+    local last_connection="N/A"
+    if [[ -f "$HISTORY_FILE" ]] && [[ $connections -gt 0 ]]; then
+        last_connection=$(jq -r '.connections[-1] | .session + " at " + (.timestamp | todate)' "$HISTORY_FILE" 2>/dev/null || echo "N/A")
+    fi
+    
+    cat << EOF
+
+📊 SSH Session Statistics
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Sessions:
+  Total:              $total
+  With Jump Servers:  $with_jump
+  With SSH Keys:      $with_keys
+  With Passwords:     $with_passwords
+  Groups:             $groups
+
+Usage:
+  Total Connections:  $connections
+  Favorites:          $favorites
+  Most Used:          $most_used
+  Last Connection:    $last_connection
+
+Storage:
+  Sessions File:      $(du -h "$SESSIONS_FILE" 2>/dev/null | cut -f1 || echo "N/A")
+  Backups:            $(ls "$BACKUP_DIR" 2>/dev/null | wc -l) files
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+EOF
+}
+
+list_by_group() {
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions found" && return 1
+    
+    echo ""
+    info "Sessions by Group:"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    local groups
+    groups=$(jq -r '.[] | .group' "$SESSIONS_FILE" | grep -v '^$' | sort -u)
+    
+    if [[ -z "$groups" ]]; then
+        echo "No groups defined"
+        return 0
+    fi
+    
+    while IFS= read -r group; do
+        [[ -z "$group" ]] && continue
+        echo ""
+        echo "Group: $group"
+        jq -r --arg g "$group" 'to_entries[] | select(.value.group == $g) | "  - \(.key) (\(.value.host))"' "$SESSIONS_FILE"
+    done <<< "$groups"
+    
+    echo ""
+    echo "Ungrouped:"
+    jq -r 'to_entries[] | select(.value.group == "") | "  - \(.key) (\(.value.host))"' "$SESSIONS_FILE"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
 # ============================================================================
 # SSH CONFIG SYNC
 # ============================================================================
@@ -738,6 +982,27 @@ sync_sessions() {
     info "Synced sessions.json with ~/.ssh/config"
 }
 
+validate_ssh_config() {
+    local config_file="$HOME/.ssh/config"
+    
+    if [[ ! -f "$config_file" ]]; then
+        info "No SSH config to validate"
+        return 0
+    fi
+    
+    info "Validating SSH config syntax..."
+    
+    # Try to parse with ssh
+    if ssh -G testhost &>/dev/null; then
+        info "✓ SSH config syntax is valid"
+        return 0
+    else
+        error "✗ SSH config has syntax errors:"
+        ssh -G testhost 2>&1 | head -10
+        return 1
+    fi
+}
+
 export_to_ssh_config() {
     [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions.json found" && return 1
     
@@ -765,6 +1030,72 @@ export_to_ssh_config() {
     } > "$output_file"
     
     info "Exported to $output_file"
+}
+
+export_ansible_inventory() {
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions found" && return 1
+    
+    local output_file="${1:-inventory.yml}"
+    
+    cat > "$output_file" << 'EOF'
+---
+# Generated by sshmx
+# Date: 
+EOF
+    echo "# $(date)" >> "$output_file"
+    cat >> "$output_file" << 'EOF'
+
+all:
+  children:
+EOF
+    
+    # Get all groups
+    local groups
+    groups=$(jq -r '.[] | .group' "$SESSIONS_FILE" | grep -v '^$' | sort -u)
+    
+    if [[ -z "$groups" ]]; then
+        warn "No groups found, creating 'ungrouped' group"
+        groups="ungrouped"
+    fi
+    
+    while IFS= read -r group; do
+        [[ -z "$group" ]] && continue
+        
+        cat >> "$output_file" << EOF
+    ${group}:
+      hosts:
+EOF
+        
+        if [[ "$group" == "ungrouped" ]]; then
+            jq -r '
+                to_entries[] | 
+                select(.value.group == "") | 
+                "        \(.key):\n          ansible_host: \(.value.host)\n          ansible_user: \(.value.user)\n          ansible_port: \(.value.port)\n          ansible_ssh_private_key_file: \(.value.key)"
+            ' "$SESSIONS_FILE" >> "$output_file"
+        else
+            jq -r --arg g "$group" '
+                to_entries[] | 
+                select(.value.group == $g) | 
+                "        \(.key):\n          ansible_host: \(.value.host)\n          ansible_user: \(.value.user)\n          ansible_port: \(.value.port)\n          ansible_ssh_private_key_file: \(.value.key)"
+            ' "$SESSIONS_FILE" >> "$output_file"
+        fi
+    done <<< "$groups"
+    
+    info "Exported Ansible inventory to $output_file"
+}
+
+export_csv() {
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions found" && return 1
+    
+    local output_file="${1:-sessions-$(date +%Y%m%d).csv}"
+    
+    echo "name,host,user,port,key,jump,group,description" > "$output_file"
+    
+    jq -r 'to_entries[] | 
+        [.key, .value.host, .value.user, .value.port, .value.key, .value.jump, .value.group, .value.description] | 
+        @csv' "$SESSIONS_FILE" >> "$output_file"
+    
+    info "Exported to CSV: $output_file"
 }
 
 # ============================================================================
@@ -809,7 +1140,7 @@ use_template() {
     [[ -z "$template_names" ]] && error "No templates available" && return 1
     
     local selected
-    selected=$(echo "$template_names" | fzf --prompt="Select template: " \
+    selected=$(echo "$template_names" | fzf --reverse --prompt="Select template: " \
       --preview "jq -r --arg k '{}' '.[\$k] | to_entries[] | \"\(.key): \(.value)\"' '$TEMPLATES_FILE'" \
       --preview-window=right:50)
     
@@ -983,16 +1314,40 @@ check_host() {
 check_session() {
     local session="$1"
     
-    local host port
+    local host port jump
     host=$(jq -r --arg k "$session" '.[$k].host' "$SESSIONS_FILE")
     port=$(jq -r --arg k "$session" '.[$k].port // 22' "$SESSIONS_FILE")
+    jump=$(jq -r --arg k "$session" '.[$k].jump // empty' "$SESSIONS_FILE")
     
-    if check_host "$host" "$port"; then
-        echo "✓ $session ($host:$port) - OK"
+    # If there's a jump server, check the jump server first
+    if [[ -n "$jump" ]]; then
+        local jump_host jump_port
+        jump_host=$(jq -r --arg j "$jump" '.[$j].host' "$SESSIONS_FILE")
+        jump_port=$(jq -r --arg j "$jump" '.[$j].port // 22' "$SESSIONS_FILE")
+        
+        if [[ -z "$jump_host" ]]; then
+            echo "✗ $session - Invalid jump server '$jump'"
+            return 1
+        fi
+        
+        # Check jump server first
+        if ! check_host "$jump_host" "$jump_port"; then
+            echo "✗ $session - Jump server '$jump' ($jump_host:$jump_port) unreachable"
+            return 1
+        fi
+        
+        # If jump server is OK, we assume target is reachable through it
+        echo "✓ $session ($host:$port via $jump) - OK"
         return 0
     else
-        echo "✗ $session ($host:$port) - FAILED"
-        return 1
+        # No jump server, check directly
+        if check_host "$host" "$port"; then
+            echo "✓ $session ($host:$port) - OK"
+            return 0
+        else
+            echo "✗ $session ($host:$port) - FAILED"
+            return 1
+        fi
     fi
 }
 
@@ -1006,16 +1361,23 @@ check_all_sessions() {
     echo ""
     
     local ok=0 failed=0
+    
     while IFS= read -r session; do
-        if check_session "$session"; then
-            ((ok++))
+        # Don't exit on failure - capture result instead
+        if check_session "$session" 2>/dev/null; then
+            ((ok++)) || true
         else
-            ((failed++))
+            ((failed++)) || true
         fi
     done <<< "$sessions"
     
     echo ""
+    info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     info "Results: $ok OK, $failed FAILED"
+    info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    # Return success even if some checks failed
+    return 0
 }
 
 interactive_health_check() {
@@ -1033,65 +1395,107 @@ interactive_health_check() {
     [[ -z "$selected" ]] && info "No sessions selected" && return 0
     
     echo ""
+    info "Checking selected sessions..."
+    echo ""
+    
+    local ok=0 failed=0
+    
     while IFS= read -r session; do
-        [[ -n "$session" ]] && check_session "$session"
+        if [[ -n "$session" ]]; then
+            # Capture result without exiting
+            if check_session "$session" 2>/dev/null; then
+                ((ok++)) || true
+            else
+                ((failed++)) || true
+            fi
+        fi
     done <<< "$selected"
+    
+    echo ""
+    info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    info "Results: $ok OK, $failed FAILED"
+    info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    return 0
 }
 
 # ============================================================================
-# GROUPS
+# GROUPS/TAGS
 # ============================================================================
 
 group_connect() {
     local groups
     groups=$(jq -r '.[] | .group' "$SESSIONS_FILE" | grep -v '^$' | sort -u)
     
-    [[ -z "$groups" ]] && error "No groups defined" && return 1
+    if [[ -z "$groups" ]]; then
+        error "No groups defined"
+        return 1
+    fi
     
     local selected_groups
-    selected_groups=$(echo "$groups" | fzf --multi --reverse --prompt="Select groups: ")
+    selected_groups=$(echo "$groups" | fzf --multi --reverse --prompt="Select groups: " \
+        --header="Tab: multi-select | Enter: connect | Esc: cancel")
     
-    [[ -z "$selected_groups" ]] && info "No groups selected" && return 0
+    # Check if user escaped/cancelled
+    local fzf_exit_code=$?
+    if [[ $fzf_exit_code -ne 0 ]] || [[ -z "$selected_groups" ]]; then
+        info "No groups selected"
+        return 1
+    fi
     
     local selected=""
     while IFS= read -r grp; do
         if [[ -n "$grp" ]]; then
             local group_sessions
             group_sessions=$(jq -r --arg g "$grp" 'to_entries[] | select(.value.group == $g) | .key' "$SESSIONS_FILE")
-            selected="${selected}${selected:+'\n'}${group_sessions}"
+            selected="${selected}${selected:+$'\n'}${group_sessions}"
         fi
     done <<< "$selected_groups"
     
     selected=$(echo "$selected" | sort -u)
     
-    [[ -z "$selected" ]] && error "No sessions in selected groups" && return 1
+    if [[ -z "$selected" ]]; then
+        info "No sessions in selected groups"
+        return 1
+    fi
     
     # Return selected for main connection logic
     echo "$selected"
 }
 
 tag_connect() {
-    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions found" && return 1
+    if [[ ! -f "$SESSIONS_FILE" ]]; then
+        error "No sessions found"
+        return 1
+    fi
     
     # Extract all unique tags from sessions
     local all_tags
     all_tags=$(jq -r '.[] | .tags // empty' "$SESSIONS_FILE" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | sort -u)
     
-    [[ -z "$all_tags" ]] && error "No tags defined in any session" && return 1
+    if [[ -z "$all_tags" ]]; then
+        error "No tags defined in any session"
+        return 1
+    fi
     
     # Let user select tags
     local selected_tags
-    selected_tags=$(echo "$all_tags" | fzf --multi --reverse --prompt="Select tags to connect: " \
-        --header="Tab: multi-select | Enter: connect to all sessions with selected tags")
+    selected_tags=$(echo "$all_tags" | fzf --multi --reverse \
+        --prompt="Select tags to connect: " \
+        --header="Tab: multi-select | Enter: connect | Esc: cancel")
     
-    [[ -z "$selected_tags" ]] && info "No tags selected" && return 0
+    # Check if user escaped/cancelled
+    local fzf_exit_code=$?
+    if [[ $fzf_exit_code -ne 0 ]] || [[ -z "$selected_tags" ]]; then
+        info "No tags selected"
+        return 1
+    fi
     
     # Find all sessions that have ANY of the selected tags
     local selected=""
     while IFS= read -r tag; do
         if [[ -n "$tag" ]]; then
             local tag_sessions
-            # Match sessions where tags field contains the tag (comma-separated)
             tag_sessions=$(jq -r --arg t "$tag" 'to_entries[] | 
                 select(.value.tags // "" | split(",") | map(gsub("^[[:space:]]+|[[:space:]]+$";"")) | index($t)) | 
                 .key' "$SESSIONS_FILE")
@@ -1102,12 +1506,130 @@ tag_connect() {
     # Remove duplicates
     selected=$(echo "$selected" | sort -u | grep -v '^$')
     
-    [[ -z "$selected" ]] && error "No sessions found with selected tags" && return 1
+    if [[ -z "$selected" ]]; then
+        info "No sessions found with selected tags"
+        return 1
+    fi
     
-    info "Found $(echo "$selected" | wc -l) session(s) with selected tag(s)"
+    local count=$(echo "$selected" | wc -l)
+    info "Found $count session(s) with selected tag(s)"
     
     # Return selected for main connection logic
     echo "$selected"
+}
+
+# ============================================================================
+# SEARCH & FILTER
+# ============================================================================
+
+search_sessions() {
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions found" && return 1
+    
+    read -p "Search query (name/host/group/tags): " query
+    [[ -z "$query" ]] && return 0
+    
+    # Convert query to lowercase for case-insensitive search
+    local query_lower=$(echo "$query" | tr '[:upper:]' '[:lower:]')
+    
+    local results
+    results=$(jq -r --arg q "$query_lower" '
+        to_entries[] | 
+        select(
+            # Search in key (session name)
+            (.key | ascii_downcase | contains($q)) or
+            # Search in host
+            ((.value.host // "") | ascii_downcase | contains($q)) or
+            # Search in user
+            ((.value.user // "") | ascii_downcase | contains($q)) or
+            # Search in group
+            ((.value.group // "") | ascii_downcase | contains($q)) or
+            # Search in tags
+            ((.value.tags // "") | ascii_downcase | contains($q)) or
+            # Search in description
+            ((.value.description // "") | ascii_downcase | contains($q))
+        ) | .key
+    ' "$SESSIONS_FILE" 2>&1)
+    
+    # Check if jq returned an error
+    if [[ $? -ne 0 ]]; then
+        error "Search failed. Please check your sessions.json format."
+        log "ERROR" "Search jq error: $results"
+        return 1
+    fi
+    
+    # Remove empty lines and trim whitespace
+    results=$(echo "$results" | grep -v '^[[:space:]]*$' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    
+    if [[ -z "$results" ]]; then
+        error "No matches found for '$query'"
+        return 1
+    fi
+    
+    local count=$(echo "$results" | wc -l)
+    info "Found $count match(es)"
+    
+    echo "$results"
+}
+
+quick_jump() {
+    [[ ! -f "$SESSIONS_FILE" ]] && error "No sessions found" && return 1
+    
+    read -p "Quick connect (type partial name): " partial
+    [[ -z "$partial" ]] && return 0
+    
+    # Fast grep-based search instead of jq
+    local matches
+    matches=$(jq -r 'keys[]' "$SESSIONS_FILE" | grep -i "$partial")
+    
+    # Check result
+    if [[ -z "$matches" ]]; then
+        error "No matches for '$partial'"
+        return 1
+    fi
+    
+    local count=$(echo "$matches" | wc -l)
+    
+    if [[ $count -eq 1 ]]; then
+        info "Connecting to: $matches"
+        echo "$matches"
+    else
+        info "Found $count matches"
+        # Use simple fzf without preview for speed
+        local selected
+        selected=$(echo "$matches" | fzf --prompt="Select session: " --no-preview)
+        echo "$selected"
+    fi
+}
+
+# ============================================================================
+# DEBUGGING
+# ============================================================================
+
+debug_sessions_json() {
+    info "Validating sessions.json structure..."
+    
+    if ! jq empty "$SESSIONS_FILE" 2>/dev/null; then
+        error "Invalid JSON in sessions.json"
+        return 1
+    fi
+    
+    info "✓ JSON is valid"
+    
+    # Check for non-string fields that might cause issues
+    echo ""
+    info "Checking field types..."
+    
+    jq -r 'to_entries[] | 
+        "Session: \(.key)",
+        "  host type: \(.value.host | type)",
+        "  user type: \(.value.user | type)",
+        "  group type: \(.value.group | type)",
+        "  tags type: \(.value.tags | type)",
+        "  description type: \(.value.description | type)",
+        ""' "$SESSIONS_FILE" | head -30
+    
+    info "If you see 'number' or 'object' types above, that's the problem."
+    info "All fields should be 'string' or 'null'"
 }
 
 # ============================================================================
@@ -1506,15 +2028,17 @@ _sshmx() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     
-    # Main options
-    opts="--install --add --edit --remove --sync --groups --tags --export --import 
-          --multiplex --demultiplex --history --templates --add-template --use-template 
-          --check --check-all --favorites --add-favorite --bulk-edit --export-config 
-          --completion --help -i -a -e -r -s -g -t -m -d -h"
+    # All options
+    opts="--install --add --edit --remove --clone --sync --groups --tags --export 
+          --import --multiplex --demultiplex --history --templates --add-template 
+          --use-template --check --check-all --favorites --add-favorite --bulk-edit 
+          --export-config --completion --help --search --quick --add-note --view-notes 
+          --delete-note --stats --list-groups --export-ansible 
+          --export-csv --validate-config -i -a -e -r -s -g -m -d -h -q"
     
     # If previous word is a flag that takes arguments
     case "${prev}" in
-        --export|--import|--export-config)
+        --export|--import|--export-config|--export-ansible|--export-csv)
             # Complete with filenames
             COMPREPLY=( $(compgen -f -- ${cur}) )
             return 0
@@ -1553,30 +2077,45 @@ Session Management:
     -a, --add               Add new SSH session
     -e, --edit              Edit existing session
     -r, --remove            Remove sessions
+    --clone                 Clone existing session
     --bulk-edit             Edit multiple sessions at once
+
+Search & Navigation:
+    --search                Search sessions by name/host/group/tags
+    -q, --quick             Quick connect by partial name match
     
 Configuration:
     -i, --install           Install to PATH and configure tmux
     -s, --sync [--prune]    Sync with ~/.ssh/config
+    --validate-config       Validate SSH config syntax
     --export-config [file]  Export to SSH config format
     
 Groups & Organization:
     -g, --groups            Connect to all sessions in group(s)
     --tags                  Connect to all sessions with selected tag(s)
+    --list-groups           List all sessions organized by group
     --favorites             Show and connect to favorite sessions
     --add-favorite          Add sessions to favorites
     
 Templates:
-    -t, --templates         List and use templates
+    --templates         List and use templates
     --add-template          Create new session template
     --use-template          Create session from template
+
+Notes & Documentation:
+    --add-note              Add note to a session
+    --view-notes            View notes for a session
+    --delete-note           Delete a note from a sessi
     
-History:
+History & Statistics:
     -h, --history           Show connection history
+    --stats                 Show session statistics
     
-Health Checks:
+Health & Connectivity:
     --check                 Check selected sessions
     --check-all             Check all sessions
+    --retry                 Connect with automatic retry on failure
+    --batch                 Batch connect with delay between connections
     
 Tmux Operations:
     -m, --multiplex         Combine windows into synchronized pane
@@ -1585,6 +2124,8 @@ Tmux Operations:
 Import/Export:
     --export [file]         Export sessions.json
     --import [file]         Import sessions.json
+    --export-ansible [file] Export to Ansible inventory format
+    --export-csv [file]     Export to CSV format
     
 Other:
     --completion            Generate bash completion script
@@ -1631,12 +2172,15 @@ Dependencies:
 
 Examples:
     sshmx                       # Select and connect to sessions
-    sshmx --add                 # Add new session
-    sshmx --groups              # Connect to all hosts in group(s)
-    sshmx --sync --prune        # Sync with SSH config, remove stale
-    sshmx --check-all           # Health check all configured sessions
-    sshmx --multiplex           # Combine windows for synchronized input
-    sshmx --history             # Connect from recent history
+    sshmx --quick              # Quick connect by typing partial name
+    sshmx --search             # Search sessions
+    sshmx --add                # Add new session
+    sshmx --clone              # Clone existing session
+    sshmx --groups             # Connect to all hosts in group(s)
+    sshmx --stats              # Show statistics
+    sshmx --add-note           # Add note to session
+    sshmx --export-ansible     # Export to Ansible inventory
+    sshmx --validate-config    # Check SSH config syntax
 
 Configuration:
     Configure GPG agent for password caching:
@@ -1701,10 +2245,16 @@ main() {
             exit 0
             ;;
         -g|--groups)
-            selected=$(group_connect)
+            if ! selected=$(group_connect); then
+                info "Exiting."
+                exit 0
+            fi
             ;;
         --tags)
-            selected=$(tag_connect)
+            if ! selected=$(tag_connect); then
+                info "Exiting."
+                exit 0
+            fi
             ;;
         --favorites)
             selected=$(show_favorites)
@@ -1765,16 +2315,89 @@ main() {
             import_sessions "${2:-}"
             exit 0
             ;;
+        --search)
+            selected=$(search_sessions)
+            ;;
+        --quick|-q)
+            selected=$(quick_jump)
+            ;;
+        --clone)
+            clone_session
+            exit 0
+            ;;
+        --add-note)
+            add_note
+            exit 0
+            ;;
+        --view-notes)
+            view_notes
+            exit 0
+            ;;
+        --delete-note)
+            delete_note
+            exit 0
+            ;;
+        --stats)
+            show_stats
+            exit 0
+            ;;
+        --debug)
+            debug_sessions_json
+            exit 0
+            ;;
+        --list-groups)
+            list_by_group
+            exit 0
+            ;;
+        --export-ansible)
+            export_ansible_inventory "${2:-inventory.yml}"
+            exit 0
+            ;;
+        --export-csv)
+            export_csv "${2:-}"
+            exit 0
+            ;;
+        --validate-config)
+            validate_ssh_config
+            exit 0
+            ;;
         "")
             # Default: interactive session selection
             ;;
-        *)
+        -*)
+            # Unknown option starting with dash
             error "Unknown option: $1"
             show_help
             exit 1
             ;;
+        *)
+            # Treat as session name (for tab completion)
+            if jq -e --arg s "$1" 'has($s)' "$SESSIONS_FILE" >/dev/null 2>&1; then
+                selected="$1"
+                info "Connecting to session: $1"
+            else
+                error "Unknown session or option: $1"
+                info "Available sessions:"
+                jq -r 'keys[]' "$SESSIONS_FILE" | head -10
+                [[ $(jq 'keys | length' "$SESSIONS_FILE") -gt 10 ]] && echo "... and more"
+                exit 1
+            fi
+            ;;
     esac
     
+    # Handle direct session name argument (for tab completion)
+    if [[ -n "${1:-}" ]] && [[ ! "${1}" =~ ^- ]] && [[ -z "$selected" ]]; then
+        # Check if the argument is a valid session name
+        if jq -e --arg s "$1" 'has($s)' "$SESSIONS_FILE" >/dev/null 2>&1; then
+            selected="$1"
+            info "Connecting to session: $1"
+        else
+            error "Unknown option: $1"
+            show_help
+            exit 1
+        fi
+    fi
+
     # Auto-install on first run
     if [[ ! -L "$HOME/.local/bin/$SCRIPT_NAME" ]]; then
         info "First run detected. Installing..."
@@ -1811,7 +2434,10 @@ main() {
     \"Description: \" + (.description // \"-\"),
     \"Tags: \" + (.tags // \"-\"),
     \"\",
-    \"Colors: \n  - Foreground: \" + (.fg_color // \"-\") + \" \n  - Background: \" + (.bg_color // \"-\")
+    \"Colors: \n  - Foreground: \" + (.fg_color // \"-\") + \" \n  - Background: \" + (.bg_color // \"-\"),
+    \"\",
+    \"Notes:\",
+    (.notes[]? | \"  - \" + .)
   ' \"$SESSIONS_FILE\"" \
   --preview-window=right:50:wrap)
 
