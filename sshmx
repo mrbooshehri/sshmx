@@ -18,11 +18,18 @@ readonly LOG_FILE="$SSHMX_DIR/sshmx.log"
 readonly LOCK_FILE="$SSHMX_DIR/.sessions.lock"
 readonly MAP_FILE="$SSHMX_DIR/sshmx-mapping"
 readonly TMUX_KEYBINDINGS_FILE="$SSHMX_DIR/tmux-keybindings.conf"
-
+readonly COLOR_MAP_FILE="$SSHMX_DIR/color-map.json"
 readonly SCRIPT_NAME="sshmx"
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly DEFAULT_SESSION="sshmx"
 readonly SYNC_WINDOW="sync-input"
+readonly SSH_OPTIONS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+readonly -a AVAILABLE_COLORS=(
+    "black" "red" "green" "yellow" "blue" "magenta" "cyan" "white"
+    "brightblack" "brightred" "brightgreen" "brightyellow" 
+    "brightblue" "brightmagenta" "brightcyan" "brightwhite"
+    "default"
+)
 
 # Create directory structure
 mkdir -p "$SSHMX_DIR" "$BACKUP_DIR"
@@ -49,6 +56,290 @@ warn() {
 info() {
     echo "$1"
     log "INFO" "$1"
+}
+
+# Get actual tmux color value from color name
+get_tmux_color() {
+    local color_name="$1"
+    [[ -z "$color_name" || "$color_name" == "default" ]] && echo "default" && return 0
+    
+    if [[ ! -f "$COLOR_MAP_FILE" ]]; then
+        echo "$color_name"
+        return 0
+    fi
+    
+    local tmux_color
+    tmux_color=$(jq -r --arg name "$color_name" '.[$name] // $name' "$COLOR_MAP_FILE" 2>/dev/null)
+    echo "$tmux_color"
+}
+
+# Color picker with fzf - shows friendly names
+pick_color() {
+    local prompt="${1:-Select color}"
+    local current="${2:-}"
+    
+    # Show current color in preview if provided
+    local preview_cmd='
+        color={}
+        echo "Color name: $color"
+        echo ""
+        if [[ -f "'"$COLOR_MAP_FILE"'" ]]; then
+            tmux_val=$(jq -r --arg c "$color" ".[\$c] // \$c" "'"$COLOR_MAP_FILE"'" 2>/dev/null)
+            echo "Tmux value: $tmux_val"
+        fi
+    '
+    
+    if [[ -n "$current" ]]; then
+        preview_cmd="$preview_cmd"'
+        echo ""
+        echo "Current: '"$current"'"
+        '
+    fi
+    
+    local selected
+    selected=$(printf '%s\n' "${AVAILABLE_COLORS[@]}" | fzf \
+        --prompt="$prompt: " \
+        --height=50% \
+        --reverse \
+        --preview="$preview_cmd" \
+        --preview-window=right:40:wrap)
+    
+    echo "$selected"
+}
+
+# Validate color name
+validate_color() {
+    local color="$1"
+    [[ -z "$color" ]] && echo "default" && return 0
+    
+    for valid_color in "${AVAILABLE_COLORS[@]}"; do
+        if [[ "$color" == "$valid_color" ]]; then
+            echo "$color"
+            return 0
+        fi
+    done
+    
+    warn "Invalid color '$color', using 'default'"
+    echo "default"
+}
+
+# Configure color mappings
+configure_colors() {
+    info "Color Configuration"
+    info "===================="
+    echo ""
+    info "Current color mappings:"
+    echo ""
+    
+    # Display current mappings in a nice format
+    jq -r 'to_entries[] | "\(.key) -> \(.value)"' "$COLOR_MAP_FILE" | column -t -s '->'
+    
+    echo ""
+    info "Options:"
+    echo "  1. Edit a color mapping"
+    echo "  2. Reset to defaults"
+    echo "  3. Edit color map file directly"
+    echo "  4. Show tmux color reference"
+    echo "  5. Back"
+    echo ""
+    
+    read -p "Select option (1-5): " option
+    
+    case "$option" in
+        1)
+            edit_color_mapping
+            ;;
+        2)
+            read -p "Reset all colors to defaults? (y/n): " confirm
+            if [[ "$confirm" == "y" ]]; then
+                rm -f "$COLOR_MAP_FILE"
+                initialize_data_files
+                info "Color map reset to defaults"
+            fi
+            ;;
+        3)
+            ${EDITOR:-nano} "$COLOR_MAP_FILE"
+            if ! jq empty "$COLOR_MAP_FILE" 2>/dev/null; then
+                error "Invalid JSON in color map file"
+                return 1
+            fi
+            info "Color map updated"
+            ;;
+        4)
+            show_tmux_color_reference
+            ;;
+        5)
+            return 0
+            ;;
+        *)
+            error "Invalid option"
+            ;;
+    esac
+}
+
+# Edit individual color mapping
+edit_color_mapping() {
+    local color_name
+    color_name=$(printf '%s\n' "${AVAILABLE_COLORS[@]}" | fzf \
+        --prompt="Select color to configure: " \
+        --height=50% \
+        --reverse \
+        --preview='
+            color={}
+            echo "Color name: $color"
+            echo ""
+            if [[ -f "'"$COLOR_MAP_FILE"'" ]]; then
+                current=$(jq -r --arg c "$color" ".[\$c] // \"not set\"" "'"$COLOR_MAP_FILE"'" 2>/dev/null)
+                echo "Current tmux value: $current"
+            fi
+        ' \
+        --preview-window=right:40:wrap)
+    
+    [[ -z "$color_name" ]] && return 0
+    
+    local current_value
+    current_value=$(jq -r --arg c "$color_name" '.[$c] // "default"' "$COLOR_MAP_FILE")
+    
+    echo ""
+    info "Configuring: $color_name"
+    info "Current value: $current_value"
+    echo ""
+    info "Common tmux color values:"
+    echo "  - Color names: black, red, green, yellow, blue, magenta, cyan, white"
+    echo "  - Bright colors: brightblack, brightred, brightgreen, etc."
+    echo "  - Color numbers: colour0 to colour255"
+    echo "  - Hex colors: #RRGGBB (e.g., #1a1a1a)"
+    echo "  - default (terminal default)"
+    echo ""
+    
+    read -p "Enter new tmux color value (or 'default'): " new_value
+    [[ -z "$new_value" ]] && new_value="default"
+    
+    acquire_lock || return 1
+    
+    jq --arg name "$color_name" --arg val "$new_value" \
+       '.[$name] = $val' \
+       "$COLOR_MAP_FILE" | atomic_write "$COLOR_MAP_FILE"
+    
+    release_lock
+    
+    info "Updated: $color_name -> $new_value"
+}
+
+# Show tmux color reference
+show_tmux_color_reference() {
+    cat << 'EOF'
+
+Tmux Color Reference
+====================
+
+Named Colors:
+  black, red, green, yellow, blue, magenta, cyan, white
+  brightblack, brightred, brightgreen, brightyellow,
+  brightblue, brightmagenta, brightcyan, brightwhite
+
+256 Colors:
+  colour0 to colour255
+  Examples:
+    - colour17  (dark blue)
+    - colour7   (light gray/white)
+    - colour232 (very dark gray)
+    - colour255 (very light gray)
+
+Hex Colors:
+  #RRGGBB format
+  Examples:
+    - #000000 (black)
+    - #FFFFFF (white)
+    - #1a1a1a (dark gray)
+    - #00ff00 (bright green)
+
+Special:
+  default - Use terminal default color
+
+Testing Colors:
+  You can test colors in tmux with:
+    tmux setw window-style "fg=colour7,bg=colour17"
+
+Press Enter to continue...
+EOF
+    read -r
+}
+
+# SSH key picker with fzf
+pick_ssh_key() {
+    local prompt="${1:-Select SSH key}"
+    local ssh_dir="$HOME/.ssh"
+    
+    # Check if .ssh directory exists
+    if [[ ! -d "$ssh_dir" ]]; then
+        warn "No ~/.ssh directory found"
+        return 1
+    fi
+    
+    # Find all potential SSH keys (files without .pub extension and common key patterns)
+    local keys
+    keys=$(find "$ssh_dir" -maxdepth 1 -type f \( -name "id_*" -o -name "*_rsa" -o -name "*_ed25519" -o -name "*_ecdsa" -o -name "*.pem" \) ! -name "*.pub" 2>/dev/null)
+    
+    # Add option to browse all files
+    local all_files
+    all_files=$(find "$ssh_dir" -maxdepth 1 -type f ! -name "*.pub" ! -name "known_hosts*" ! -name "config" ! -name "authorized_keys" 2>/dev/null)
+    
+    # Combine and remove duplicates
+    local combined
+    combined=$(echo -e "$keys\n$all_files" | sort -u | grep -v '^$')
+    
+    if [[ -z "$combined" ]]; then
+        warn "No SSH keys found in $ssh_dir"
+        return 1
+    fi
+    
+    # Add options for manual entry and no key
+    local selected
+    selected=$(echo -e "[No key]\n[Enter path manually]\n$combined" | fzf \
+        --prompt="$prompt: " \
+        --height=60% \
+        --reverse \
+        --preview='
+            if [[ {} == \[*\] ]]; then
+                echo "Special option selected"
+            elif [[ -f {} ]]; then
+                echo "Key: {}"
+                echo ""
+                echo "File info:"
+                ls -lh {} 2>/dev/null
+                echo ""
+                echo "Permissions: $(stat -c %a {} 2>/dev/null || stat -f %A {})"
+                echo ""
+                if command -v ssh-keygen &>/dev/null; then
+                    echo "Key fingerprint:"
+                    ssh-keygen -lf {} 2>/dev/null || echo "Not a valid SSH key"
+                fi
+            fi
+        ' \
+        --preview-window=right:50:wrap)
+    
+    # Handle selection
+    if [[ -z "$selected" ]]; then
+        return 1
+    elif [[ "$selected" == "[No key]" ]]; then
+        echo ""
+        return 0
+    elif [[ "$selected" == "[Enter path manually]" ]]; then
+        read -e -p "Enter SSH key path: " manual_path
+        # Expand tilde
+        manual_path="${manual_path/#\~/$HOME}"
+        if [[ -f "$manual_path" ]]; then
+            echo "$manual_path"
+            return 0
+        else
+            warn "File not found: $manual_path"
+            return 1
+        fi
+    else
+        echo "$selected"
+        return 0
+    fi
 }
 
 # Ensure GPG_TTY is set
@@ -153,6 +444,32 @@ initialize_data_files() {
     
     [[ -f "$TEMPLATES_FILE" ]] || echo '{}' | atomic_write "$TEMPLATES_FILE"
     [[ -f "$HISTORY_FILE" ]] || echo '{"connections": [], "favorites": []}' | atomic_write "$HISTORY_FILE"
+
+    # Initialize color map with defaults if not exists
+    if [[ ! -f "$COLOR_MAP_FILE" ]]; then
+        cat > "$COLOR_MAP_FILE" << 'EOF'
+{
+  "black": "black",
+  "red": "red",
+  "green": "green",
+  "yellow": "yellow",
+  "blue": "blue",
+  "magenta": "magenta",
+  "cyan": "cyan",
+  "white": "white",
+  "brightblack": "brightblack",
+  "brightred": "brightred",
+  "brightgreen": "brightgreen",
+  "brightyellow": "brightyellow",
+  "brightblue": "brightblue",
+  "brightmagenta": "brightmagenta",
+  "brightcyan": "brightcyan",
+  "brightwhite": "brightwhite",
+  "default": "default"
+}
+EOF
+        log "INFO" "Created default color map at $COLOR_MAP_FILE"
+    fi
 }
 
 # ============================================================================
@@ -309,6 +626,7 @@ EOF
     info "  prefix+H: Connection history"
     info ""
     info "When running sshmx, temporary Ctrl+Alt+key bindings are also available"
+    info "Note: SSH fingerprint checking is disabled for convenience"
     info "============================================"
 }
 
@@ -375,7 +693,17 @@ add_session() {
     port=${port:-22}
     [[ ! "$port" =~ ^[0-9]+$ ]] && warn "Invalid port, using 22" && port=22
 
-    read -p "Private key path (optional): " key
+    # Key selection with picker
+    echo ""
+    read -p "Use SSH key? (y/n): " use_key
+    local key=""
+    if [[ "$use_key" == "y" ]]; then
+        key=$(pick_ssh_key "Select SSH private key" || echo "")
+        if [[ -n "$key" ]]; then
+            info "Selected key: $key"
+        fi
+    fi
+
     read -s -p "Password (optional, will be encrypted): " password
     echo
     read -p "Jump server (optional): " jump
@@ -384,8 +712,16 @@ add_session() {
     read -p "Port forwards (optional, format: local:remote:port): " port_forward
     read -p "Description (optional): " description
     read -p "Tags (comma-separated, optional): " tags
-    read -p "Background color (optional): " bg_color
-    read -p "Foreground color (optional): " fg_color
+
+    # Color selection with picker
+    echo ""
+    info "Select colors (or press ESC for default):"
+    local bg_color fg_color
+    bg_color=$(pick_color "Background color" || echo "default")
+    fg_color=$(pick_color "Foreground color" || echo "default")
+    
+    bg_color=$(validate_color "$bg_color")
+    fg_color=$(validate_color "$fg_color")
 
     local enc_pw=""
     if [[ -n "$password" ]]; then
@@ -465,8 +801,16 @@ edit_session() {
     user=${user:-$current_user}
     read -p "Port (current: $current_port): " port
     port=${port:-$current_port}
-    read -p "Key (current: $current_key): " key
-    key=${key:-$current_key}
+    # Key selection
+    echo ""
+    read -p "Change SSH key? (y/n, current: ${current_key:-none}): " change_key
+    local key="$current_key"
+    if [[ "$change_key" == "y" ]]; then
+        key=$(pick_ssh_key "Select SSH private key" || echo "$current_key")
+        if [[ "$key" != "$current_key" ]]; then
+            info "Key changed to: ${key:-none}"
+        fi
+    fi
     read -s -p "Password (leave blank to keep current, enter new to change): " password
     echo
     read -p "Jump (current: $current_jump): " jump
@@ -479,10 +823,16 @@ edit_session() {
     description=${description:-$current_desc}
     read -p "Tags (current: $current_tags): " tags
     tags=${tags:-$current_tags}
-    read -p "BG color (current: $current_bg): " bg_color
-    bg_color=${bg_color:-$current_bg}
-    read -p "FG color (current: $current_fg): " fg_color
-    fg_color=${fg_color:-$current_fg}
+    # Color selection
+    echo ""
+    read -p "Change colors? (y/n, current: fg=$current_fg bg=$current_bg): " change_colors
+    local bg_color="$current_bg" fg_color="$current_fg"
+    if [[ "$change_colors" == "y" ]]; then
+        bg_color=$(pick_color "Background color" || echo "$current_bg")
+        fg_color=$(pick_color "Foreground color" || echo "$current_fg")
+        bg_color=$(validate_color "$bg_color")
+        fg_color=$(validate_color "$fg_color")
+    fi
 
     local enc_pw
     enc_pw=$(echo "$current" | jq -r '.password_encrypted // empty')
@@ -578,9 +928,15 @@ bulk_edit() {
     echo "Bulk edit options (leave blank to skip):"
     read -p "Set group: " new_group
     read -p "Set jump server: " new_jump
-    read -p "Set background color: " new_bg
-    read -p "Set foreground color: " new_fg
     read -p "Add tags (comma-separated): " new_tags
+    local new_bg="" new_fg=""
+    read -p "Change colors? (y/n): " change_colors
+    if [[ "$change_colors" == "y" ]]; then
+        new_bg=$(pick_color "Background color" || echo "")
+        new_fg=$(pick_color "Foreground color" || echo "")
+        new_bg=$(validate_color "$new_bg")
+        new_fg=$(validate_color "$new_fg")
+    fi
 
     acquire_lock || return 1
     
@@ -1111,7 +1467,13 @@ add_template() {
     read -p "User: " user
     read -p "Port (default: 22): " port
     port=${port:-22}
-    read -p "Key path: " key
+    # Key selection with picker
+    echo ""
+    read -p "Use SSH key? (y/n): " use_key
+    local key=""
+    if [[ "$use_key" == "y" ]]; then
+        key=$(pick_ssh_key "Select SSH private key" || echo "")
+    fi
     read -p "Jump server: " jump
     read -p "Group: " group
     read -p "Description: " description
@@ -1759,12 +2121,16 @@ demultiplex() {
             warn "rename-window failed for $new_win_id -> $orig_name"
             tmux rename-window -t "$new_win_id" "${orig_name}-restored" 2>/dev/null
         fi
-        
+
         # Restore colors if they were set and not "default"
         if [[ -n "$bg_color" && "$bg_color" != "default" && -n "$fg_color" && "$fg_color" != "default" ]]; then
-            tmux setw -t "$new_win_id" window-style "fg=$fg_color,bg=$bg_color" 2>/dev/null
-            tmux setw -t "$new_win_id" window-active-style "fg=$fg_color,bg=$bg_color" 2>/dev/null
-            log "INFO" "Restored colors for window $new_win_id: fg=$fg_color bg=$bg_color"
+            # Convert friendly names to tmux colors
+            local tmux_bg=$(get_tmux_color "$bg_color")
+            local tmux_fg=$(get_tmux_color "$fg_color")
+            
+            tmux setw -t "$new_win_id" window-style "fg=$tmux_fg,bg=$tmux_bg" 2>/dev/null
+            tmux setw -t "$new_win_id" window-active-style "fg=$tmux_fg,bg=$tmux_bg" 2>/dev/null
+            log "INFO" "Restored colors for window $new_win_id: fg=$tmux_fg bg=$tmux_bg"
         fi
     done < "$MAP_FILE"
 
@@ -1908,6 +2274,8 @@ Host target
     User $user
     Port $port
     ProxyJump $jump_user@$jump_host:$jump_port
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
 EOF
         [[ -n "$key" ]] && echo "    IdentityFile $key" >> "$temp_config"
         [[ -n "$jump_key" ]] && echo -e "\nHost *\n    IdentityFile $jump_key" >> "$temp_config"
@@ -1927,7 +2295,7 @@ EOF
         log "INFO" "Created jump server config: $temp_config"
     else
         # Direct connection
-        ssh_cmd="ssh $user@$connect_host"
+        ssh_cmd="ssh $SSH_OPTIONS $user@$connect_host"
         [[ "$port" != "22" ]] && ssh_cmd="$ssh_cmd -p $port"
         [[ -n "$key" ]] && ssh_cmd="$ssh_cmd -i \"$key\""
         [[ -n "$port_forward" ]] && ssh_cmd="$ssh_cmd -L $port_forward"
@@ -1969,6 +2337,14 @@ connect_session() {
     local bg_color fg_color
     bg_color=$(jq -r --arg key "$session" '.[$key].bg_color // empty' "$SESSIONS_FILE")
     fg_color=$(jq -r --arg key "$session" '.[$key].fg_color // empty' "$SESSIONS_FILE")
+
+    # Convert friendly color names to tmux colors
+    if [[ -n "$bg_color" && "$bg_color" != "default" ]]; then
+        bg_color=$(get_tmux_color "$bg_color")
+    fi
+    if [[ -n "$fg_color" && "$fg_color" != "default" ]]; then
+        fg_color=$(get_tmux_color "$fg_color")
+    fi
     
     # Generate unique window name using your original logic
     local base_name="$session"
@@ -2081,6 +2457,7 @@ Search & Navigation:
 Configuration:
     -i, --install           Install to PATH and configure tmux
     -s, --sync [--prune]    Sync with ~/.ssh/config
+    --configure-colors      Configure color name to tmux color mappings
     --validate-config       Validate SSH config syntax
     --export-config [file]  Export to SSH config format
     
@@ -2145,11 +2522,13 @@ Session Storage:
     ~/.sshmx/sessions.json      Session configurations
     ~/.sshmx/templates.json     Session templates
     ~/.sshmx/history.json       Connection history
+    ~/.sshmx/color-map.json     Custom color mappings
     ~/.sshmx/backups/           Automatic backups
     ~/.sshmx/sshmx.log          Activity log
 
 Features:
     - GPG-encrypted passwords (prefer SSH keys)
+    - Interactive SSH key picker with preview
     - Jump server (ProxyJump) support
     - Port forwarding configuration
     - Session groups and favorites
@@ -2353,6 +2732,10 @@ main() {
             ;;
         --validate-config)
             validate_ssh_config
+            exit 0
+            ;;
+        --configure-colors)
+            configure_colors
             exit 0
             ;;
         "")
