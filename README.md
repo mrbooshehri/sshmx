@@ -1,27 +1,41 @@
 # sshmx - SSH Session Manager for tmux
 
 `sshmx` is a lightweight Bash utility that helps you manage and launch SSH sessions inside [`tmux`](https://github.com/tmux/tmux).  
-It integrates with your existing `~/.ssh/config` or lets you add/remove sessions interactively, and provides handy **tmux key bindings** (`Ctrl+b C-s` for sessions, `Ctrl+b C-g` for groups) to quickly open SSH connections in popup windows.
+It integrates with your existing `~/.ssh/config` or lets you add/remove sessions interactively, and provides handy **tmux key bindings** to quickly open SSH connections in popup windows.
 
 ---
 
 ## ✨ Features
 - **Interactive SSH session selector** using [fzf](https://github.com/junegunn/fzf) with multi-select and preview
-- **Automatic JSON session store** (`~/.ssh/sessions.json`)
+- **Automatic JSON session store** (`~/.sshmx/sessions.json`)
 - **Import from `~/.ssh/config`** or create sessions manually
 - **tmux integration**:
   - New SSH sessions open in dedicated `tmux` windows
-  - Popup window shortcuts (`Ctrl+b C-s` for sessions, `Ctrl+b C-g` for groups) to run `sshmx`
+  - Permanent popup window shortcuts (customizable via `~/.tmux.conf`)
+  - Automatic fingerprint acceptance (no host key verification prompts)
+- **Interactive SSH key picker** with preview, fingerprint display, and file browser
 - **Jump host (ProxyJump) support**
-- **Password and private key support** (passwords are stored encrypted with GPG; `sshpass` is used for authentication when needed)
+- **Password and private key support** (passwords stored encrypted with GPG; `sshpass` used for authentication)
 - **Group support**: Organize and connect to all sessions in a group at once
+- **Tag support**: Connect to sessions by comma-separated tags
+- **Custom color system**: User-configurable color mappings (e.g., map "blue" → "colour17")
 - **Export/Import sessions** for backups and sharing
 - **Optional colored output** with [chromaterm](https://github.com/hSaria/Chromaterm)
 - **Host IP resolution** using `getent` (if available)
 - **Self-installing** script – just run once and it sets itself up
 - **Sync with `~/.ssh/config`** preserving encrypted passwords and groups
 - **Logging** for debugging parsing issues
-- **Password migration** tool: convert old plaintext passwords to GPG-encrypted format
+- **Session notes**: Add, view, and delete per-session notes
+- **Favorites**: Mark and quickly access favorite sessions
+- **Templates**: Create reusable session templates for quick setup
+- **Health checks**: Verify host connectivity with `nc` or TCP
+- **Statistics**: View session counts, usage, and most-connected hosts
+- **Bulk edit**: Update groups, jumps, tags, and colors across multiple sessions
+- **Search**: Fuzzy search by name, host, group, tags, or description
+- **Quick connect**: Partial name matching for fast access
+- **Exports**: To SSH config, Ansible inventory, or CSV
+- **Automatic daily backups** with retention
+- **Full bash completion** for all commands and options
 
 ---
 
@@ -29,9 +43,11 @@ It integrates with your existing `~/.ssh/config` or lets you add/remove sessions
 - [tmux](https://github.com/tmux/tmux)
 - [fzf](https://github.com/junegunn/fzf)
 - [jq](https://github.com/stedolan/jq)
+- [gpg](https://gnupg.org/) (for password encryption)
 - [sshpass](https://linux.die.net/man/1/sshpass) *(optional, for password auth)*
 - [chromaterm](https://github.com/hSaria/Chromaterm) *(optional, for colored output)*
 - `getent` *(optional, for hostname to IP resolution; usually available on Linux)*
+- `nc` *(optional, for health checks)*
 
 ---
 
@@ -39,16 +55,17 @@ It integrates with your existing `~/.ssh/config` or lets you add/remove sessions
 Clone the repository and run the script with the `--install` flag:
 
 ```bash
-git clone https://github.com/yourusername/sshmx.git
+git clone https://github.com/mrbooshehri/sshmx.git
 cd sshmx
 ./sshmx --install
 ```
 
 This will:
 * Create a symlink to `~/.local/bin/sshmx`
-* Add `Ctrl+b C-s` and `Ctrl+b C-g` bindings to your `~/.tmux.conf` (or create one if missing)
-* Add bash completion for command flags
-* Add `~/.local/bin` to your PATH (via `~/.bashrc`)
+* Add keybindings to your `~/.tmux.conf` (or create one if missing)
+* Add bash completion for all commands
+* Add `~/.local/bin` to your PATH (via `~/.bashrc` or `~/.zshrc`)
+* Initialize color mapping configuration
 
 Reload tmux:
 
@@ -56,289 +73,463 @@ Reload tmux:
 tmux source-file ~/.tmux.conf
 ```
 
-And source bashrc:
+And source your shell RC file:
 
 ```bash
-source ~/.bashrc
+source ~/.bashrc  # or ~/.zshrc
 ```
 
 ---
 
 ## 🔑 Usage
 
+### Basic Commands
+
 | Command                        | Description                                                       |
 | ------------------------------ | ----------------------------------------------------------------- |
 | `sshmx`                        | Launch interactive session selector with `fzf` (multi-select, preview) |
 | `sshmx --add` / `sshmx -a`     | Add a new SSH session interactively                               |
+| `sshmx --edit` / `sshmx -e`    | Edit an existing session interactively                            |
 | `sshmx --remove` / `sshmx -r`  | Remove one or more sessions interactively (with backup)           |
+| `sshmx --clone`                | Clone an existing session                                         |
+| `sshmx --bulk-edit`            | Bulk-edit multiple sessions (groups, jumps, tags, colors)         |
+
+### Installation & Configuration
+
+| Command                        | Description                                                       |
+| ------------------------------ | ----------------------------------------------------------------- |
 | `sshmx --install` / `sshmx -i` | Install script, create symlink, add tmux bindings, bash completion |
-| `sshmx --sync` / `sshmx -s`    | Sync `~/.ssh/sessions.json` with `~/.ssh/config` (preserves passwords/groups) |
+| `sshmx --sync` / `sshmx -s`    | Sync `~/.sshmx/sessions.json` with `~/.ssh/config` (preserves passwords/groups) |
+| `sshmx --configure-colors`     | Configure color name to tmux color mappings (with 256-color palette preview) |
+| `sshmx --validate-config`      | Validate SSH config syntax                                        |
+
+### Search & Navigation
+
+| Command                        | Description                                                       |
+| ------------------------------ | ----------------------------------------------------------------- |
+| `sshmx --search`               | Search sessions by name/host/group/tags/description               |
+| `sshmx --quick` / `sshmx -q`   | Quick connect by partial name match                               |
+| `sshmx --history` / `sshmx -h` | Show connection history (most recent first)                       |
+
+### Groups & Tags
+
+| Command                        | Description                                                       |
+| ------------------------------ | ----------------------------------------------------------------- |
 | `sshmx --groups` / `sshmx -g`  | Select and connect to all sessions in chosen group(s)             |
-| `sshmx --multiplex` / `sshmx -m` | Select active tmux windows (SSH sessions) and move them to a single synchronized window for multiplex commands |
-| `sshmx --demultiplex` / `sshmx -d` | Restore panes from a multiplexed window back to separate windows |
-| `sshmx --export` / `sshmx -e`  | Export `sessions.json` to a backup file (prompts for filename)    |
-| `sshmx --import` / `sshmx -p`  | Import sessions from a JSON file (overwrites current, backs up existing) |
-| `sshmx --migrate-passwords` | Migrate old plaintext passwords in `sessions.json` to encrypted GPG format |
-| `sshmx --help` / `sshmx -h`    | Show this help message                                           |
+| `sshmx --tags`                 | Connect to all sessions with selected tag(s)                      |
+| `sshmx --list-groups`          | List all sessions organized by group                              |
+
+### Favorites & Templates
+
+| Command                        | Description                                                       |
+| ------------------------------ | ----------------------------------------------------------------- |
+| `sshmx --favorites`            | Show and connect to favorite sessions                             |
+| `sshmx --add-favorite`         | Add sessions to favorites                                         |
+| `sshmx --templates`            | List available templates                                          |
+| `sshmx --add-template`         | Create new session template                                       |
+| `sshmx --use-template`         | Create session from template                                      |
+
+### Notes & Documentation
+
+| Command                        | Description                                                       |
+| ------------------------------ | ----------------------------------------------------------------- |
+| `sshmx --add-note`             | Add note to a session                                             |
+| `sshmx --view-notes`           | View notes for a session                                          |
+| `sshmx --delete-note`          | Delete a note from a session                                      |
+
+### Health & Statistics
+
+| Command                        | Description                                                       |
+| ------------------------------ | ----------------------------------------------------------------- |
+| `sshmx --check`                | Check connectivity of selected sessions                           |
+| `sshmx --check-all`            | Check connectivity of all sessions                                |
+| `sshmx --stats`                | Show session statistics and usage                                 |
+
+### Multiplex Operations
+
+| Command                        | Description                                                       |
+| ------------------------------ | ----------------------------------------------------------------- |
+| `sshmx --multiplex` / `sshmx -m` | Combine windows into synchronized pane for multi-host commands   |
+| `sshmx --demultiplex` / `sshmx -d` | Restore multiplexed windows to separate panes                    |
+
+### Import/Export
+
+| Command                        | Description                                                       |
+| ------------------------------ | ----------------------------------------------------------------- |
+| `sshmx --export [file]`        | Export `sessions.json` to a backup file                           |
+| `sshmx --import [file]`        | Import sessions from a JSON file (backs up existing)              |
+| `sshmx --export-config [file]` | Export to SSH config format                                       |
+| `sshmx --export-ansible [file]` | Export to Ansible inventory format                               |
+| `sshmx --export-csv [file]`    | Export to CSV format                                              |
+
+### Other
+
+| Command                        | Description                                                       |
+| ------------------------------ | ----------------------------------------------------------------- |
+| `sshmx --completion`           | Generate bash completion script                                   |
+| `sshmx --debug`                | Debug sessions.json structure                                     |
+| `sshmx --help`                 | Show help message                                                 |
 
 ---
 
-### First run
-The script auto-generates a `sessions.json` file at `~/.ssh/sessions.json` by parsing your `~/.ssh/config`.  
-If no sessions are found, it creates a sample entry.  
-On first run without installation, it auto-installs itself.
+## 🎨 Color Configuration
 
----
+The script supports a user-configurable color mapping system that lets you use friendly color names (like "blue", "white") that map to actual tmux color values (like "colour17", "colour7").
 
-### Launch SSH sessions
+### Configure Colors
 
 ```bash
-sshmx
+sshmx --configure-colors
 ```
 
-* Prompts you with an `fzf` selector of available sessions (multi-select, with preview of details)
-* Selected hosts open as **new windows** in your tmux session
-* If run outside tmux, a new session named `sshmx` is created
-* Supports keys, encrypted passwords (via `sshpass` after decryption), jump servers, and optional coloring with `chromaterm`
-* Hostnames are resolved to IPs if possible for faster connections
+This opens an interactive menu where you can:
+1. **Edit a color mapping** - Map friendly names to tmux colors
+2. **Reset to defaults** - Restore default color mappings
+3. **Edit color map file directly** - Advanced editing
+4. **Show tmux color reference** - View 256-color palette with visual demonstration
+5. **Back** - Return to main menu
 
-Or use the tmux shortcut: `Ctrl+b C-s`
+### Color Reference
+
+The color reference displays all 256 colors with their numbers, making it easy to pick the exact color you want:
+
+```
+256 Color Palette Demonstration:
+=================================
+
+  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16  17
+ 18  19  20  21  22  23  24  25  26  27  28  29  30  31  32  33  34  35
+...
+
+Note: The number shown is the 'colourN' value for tmux
+Example: Number 17 = colour17, Number 7 = colour7
+```
+
+### Example Configuration
+
+1. Run `sshmx --configure-colors`
+2. Select "Edit a color mapping"
+3. Choose "blue" from the list
+4. Enter "colour17" as the tmux value
+5. Repeat for "white" → "colour7"
+
+Now when you add or edit sessions and select "blue" as background and "white" as foreground, it will automatically use colour17 and colour7.
+
+### Supported Color Formats
+
+- **Named colors**: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`
+- **Bright colors**: `brightblack`, `brightred`, `brightgreen`, etc.
+- **256 colors**: `colour0` to `colour255`
+- **Hex colors**: `#RRGGBB` (e.g., `#1a1a1a`)
+- **Default**: `default` (terminal default color)
 
 ---
 
-### Use Groups
+## 🔑 SSH Key Picker
 
-Organize sessions by adding a `group` field when using `--add`.
-To connect to all in a group:
-
-```bash
-sshmx --groups
-```
-
-or
-
-```bash
-sshmx -g
-```
-
-* `fzf` shows unique groups with preview of sessions in each
-* Select one or more groups; all sessions in them open as tmux windows
-* Or use tmux shortcut: `Ctrl+b C-g`
-
----
-
-### Add a new session
+When adding or editing sessions, sshmx provides an interactive SSH key picker:
 
 ```bash
 sshmx --add
+# When prompted "Use SSH key? (y/n):"
 ```
 
-or
-
-```bash
-sshmx -a
-```
-
-Prompts for session name, hostname/IP, user (default: current), port (default: 22), private key (optional), password (optional, will be encrypted with GPG), jump server (optional), group (optional).
-Appends to `sessions.json`.
+The picker shows:
+- All SSH keys in `~/.ssh/` (id_*, *_rsa, *_ed25519, *.pem)
+- File info (size, permissions)
+- Key fingerprint (if valid)
+- Options for:
+  - `[No key]` - Don't use a key
+  - `[Enter path manually]` - Type a custom path
+  - Browse and select from found keys
 
 ---
 
-### Remove sessions
+## 🔐 Password Encryption
+
+Passwords are automatically encrypted with GPG when you add them:
 
 ```bash
-sshmx --remove
+sshmx --add
+# Enter password when prompted
+# Password is encrypted and stored as password_encrypted
 ```
 
-or
+**Important**: Configure GPG agent for better experience:
 
 ```bash
-sshmx -r
+echo "default-cache-ttl 3600" >> ~/.gnupg/gpg-agent.conf
+gpgconf --kill gpg-agent
 ```
 
-Lets you multi-select sessions to delete using `fzf` (with preview).  
-A timestamped backup of `sessions.json` is automatically created.
+This caches your GPG passphrase for 1 hour, so you don't have to re-enter it for every connection.
 
 ---
 
-### Sync sessions from `~/.ssh/config`
+## 🚫 SSH Fingerprint Handling
+
+sshmx automatically disables SSH host key checking to avoid fingerprint prompts:
 
 ```bash
-sshmx --sync
+# These options are automatically added:
+-o StrictHostKeyChecking=no
+-o UserKnownHostsFile=/dev/null
 ```
 
-or
-
-```bash
-sshmx -s
-```
-
-Parses `~/.ssh/config` for Host blocks (HostName, User, Port, IdentityFile, ProxyJump).  
-Updates or adds sessions in `~/.ssh/sessions.json`, preserving existing passwords and groups.  
-Resolves hostnames to IPs if possible. Logs details to `~/.sshmx.log`.
+This means you won't be prompted to accept host fingerprints on first connection. If you need strict host key checking for security, you can modify the `SSH_OPTIONS` constant in the script.
 
 ---
 
-### Multiplex / Demultiplex Commands (Synchronized Input Across Hosts)
+## 🖥️ Tmux Keybindings
 
-Use **Multiplex** to combine multiple active SSH windows into a single tmux window with synchronized input enabled — allowing commands to be run on all selected hosts simultaneously.
+After installation, the following keybindings are available in tmux:
 
-```bash
-sshmx --multiplex
-```
+| Shortcut                | Action                                      |
+|-------------------------|---------------------------------------------|
+| `prefix + C-s`          | Open session selector in popup              |
+| `prefix + C-g`          | Open group selector in popup                |
+| `prefix + C-m`          | Open multiplex selector in popup            |
+| `prefix + C-q`          | Demultiplex panes back to separate windows  |
+| `prefix + C-y`          | Connection history in popup                 |
+| `prefix + C-k`          | Check all hosts                             |
 
-or
-
-```bash
-sshmx -m
-```
-
-Then, to **Demultiplex** and restore each host’s pane back to a separate window:
-
-```bash
-sshmx --demultiplex
-```
-
-or
-
-```bash
-sshmx -d
-```
-
-This workflow lets you easily switch between centralized control and individual host sessions.
+**Note**: `prefix` is typically `Ctrl+b` in tmux.
 
 ---
 
-### Export/Import sessions
+## 📂 Directory Structure
 
-**Export:**
-
-```bash
-sshmx --export
 ```
-or
-
-```bash
-sshmx -e
+~/.sshmx/
+├── sessions.json          # Your SSH sessions
+├── templates.json         # Session templates
+├── history.json           # Connection history and favorites
+├── color-map.json         # Custom color mappings
+├── sshmx.log             # Activity log
+└── backups/              # Automatic daily backups
+    └── auto-backup-YYYYMMDD.json.gz
 ```
-
-Prompts for filename (default: `sessions-backup-YYYYMMDD_HHMMSS.json`); copies `sessions.json` there.
-
-**Import:**
-
-```bash
-sshmx --import /path/to/file.json
-```
-
-or
-
-```bash
-sshmx -i /path/to/file.json
-```
-
-Backs up current `sessions.json`, then overwrites with the import file.
 
 ---
 
-### 🔐 Migrate Passwords
-
-
-If you previously stored plain-text passwords in `~/.ssh/sessions.json`, you can securely encrypt them using:
-
-
-```bash
-sshmx --migrate-passwords
-```
-
-
-This command:
-- Finds any `password` fields in `sessions.json`
-- Encrypts them using **GPG** and replaces them with `password_encrypted`
-- Deletes the old plain-text password entries
-- Exits immediately after completing the migration
-
-
-> ⚠️ This command should only be needed once after upgrading from older versions.
-
----
-
-## 🎨 Background / Foreground Color
-
-The script supports optional **background** and **foreground** color settings for each SSH session. When both `bg_color` and `fg_color` are defined in your `sessions.json`, `sshmx` will:
-
-- Create the tmux window with the specified colors.
-- Apply `window-style` and `window-active-style` so the window appears with those colors.
-
-Example entry in `sessions.json`:
+## 📝 Session JSON Format
 
 ```json
 {
-  "myserver": {
+  "session_name": {
     "host": "example.com",
-    "user": "user",
+    "user": "username",
     "port": 22,
     "key": "~/.ssh/id_rsa",
-    "bg_color": "black",
-    "fg_color": "green"
+    "password_encrypted": "base64_encrypted_data...",
+    "jump": "bastion",
+    "group": "production",
+    "port_forward": "8080:localhost:80",
+    "description": "Production web server",
+    "tags": "web,production,critical",
+    "bg_color": "blue",
+    "fg_color": "white",
+    "notes": ["Note 1", "Note 2"],
+    "created": 1699564800,
+    "modified": 1699564800
   }
 }
 ```
 
-> **Note:** Colors must be valid tmux color names or hex codes.
+---
+
+## 🛠️ Example Workflows
+
+### Quick Start
+
+```bash
+# 1. Sync from existing SSH config
+sshmx --sync
+
+# 2. Launch interactive selector
+sshmx
+
+# 3. Or use tmux shortcut
+# Press: Ctrl+b then C-s
+```
+
+### Adding a Session with Custom Colors
+
+```bash
+# 1. Add a new session
+sshmx --add
+
+# 2. Follow prompts:
+Session name: webserver
+Host/IP: 192.168.1.100
+User: admin
+Port: 22
+
+# 3. Use SSH key picker
+Use SSH key? (y/n): y
+# Select from ~/.ssh/ or enter path
+
+# 4. Configure colors
+Select colors (or press ESC for default):
+# Use fzf to select "blue" for background
+# Use fzf to select "white" for foreground
+
+# Session created with your configured color mapping!
+```
+
+### Connect to Group
+
+```bash
+# Connect to all servers in "production" group
+sshmx --groups
+
+# Select "production" from list
+# All sessions open in separate tmux windows
+```
+
+### Multiplex for Commands
+
+```bash
+# 1. Connect to multiple servers
+sshmx --groups  # or select multiple sessions
+
+# 2. Multiplex them
+sshmx --multiplex
+
+# 3. Commands are now sent to all servers simultaneously
+# Type once, execute everywhere!
+
+# 4. When done, demultiplex
+sshmx --demultiplex
+
+# Each server returns to its own window
+```
+
+### Search and Quick Connect
+
+```bash
+# Search by any field
+sshmx --search
+Search query: production web
+
+# Or quick partial match
+sshmx --quick
+Quick connect: prod
+# Instantly connects if unique, or shows matches
+```
 
 ---
 
-## 🖥️ Example Workflow
-1. Press `Ctrl+b C-s` (or `C-g` for groups) inside tmux
-2. `fzf` shows your saved sessions (or groups) with previews
-3. Select one or more
-4. New tmux windows open, each running SSH into the chosen host(s)
+## 🔒 Security Best Practices
+
+1. **Use SSH keys** instead of passwords whenever possible
+2. **Configure GPG agent** to cache passphrases securely
+3. **Review backups** before importing sessions
+4. **Keep sessions.json private** (`chmod 600 ~/.sshmx/sessions.json`)
+5. **Regularly rotate** SSH keys and passwords
+6. **Enable strict host checking** in production if required (modify `SSH_OPTIONS`)
+7. **Use jump servers** (bastions) for accessing internal networks
+8. **Encrypt the entire ~/.sshmx directory** for additional security (optional)
 
 ---
 
-## 📂 Files
-* `~/.ssh/sessions.json` → Stores your SSH sessions in JSON format: `{ "session_name": { "host": "...", "user": "...", "port": 22, "key": "...", "password_encrypted": "...", "jump": "...", "group": "...", "bg_color": "", "fg_color": "" } }`
-* `~/.sshmx.log` → Log file with parsing and sync details
-* `~/.tmux.conf` → Key bindings automatically added here
-* `~/.local/bin/sshmx` → Symlink to the script for global usage
+## 🐛 Troubleshooting
 
----
+### GPG Decryption Fails
 
-## ⚠️ Security Notes
-* Passwords are stored encrypted in `sessions.json` (field `password_encrypted`) when provided; they are encrypted with GPG. Plain‑text passwords are no longer used.
-  → **Highly recommended** to use SSH keys instead (`IdentityFile` in config or key field)
-* Temporary configs for jump hosts are auto-cleaned (shredded) after use
-* Use export/import carefully; always review backups
-* For production, consider encrypting the JSON file or using a secure vault
+```bash
+# Set GPG_TTY
+export GPG_TTY=$(tty)
 
----
+# Configure agent
+echo "default-cache-ttl 3600" >> ~/.gnupg/gpg-agent.conf
+gpgconf --kill gpg-agent
+```
 
-## 🛠️ Roadmap / Ideas
-* [x] Encrypted session store (e.g., with gpg or pass)
-* [x] On-demand sync with `~/.ssh/config` (`-s / --sync`)
-* [x] Advanced UI with [fzf preview](https://github.com/junegunn/fzf#preview-window)
-* [x] Grouped sessions (connect to multiple related servers at once with `-g`)
-* [x] Multiplex commands (run the same command across selected hosts)
-* [x] Export/import session configs (share with teammates via `-e`/`-p`)
-* [x] Custom background/foreground color to seperate envs
+### Colors Don't Appear
 
----
+```bash
+# Check color mapping
+cat ~/.sshmx/color-map.json
 
-### Tmux Shortcuts
-| Shortcut     | Action                  |
-|--------------|-------------------------|
-| `Ctrl+b C-s` | Open session selector   |
-| `Ctrl+b C-g` | Open group selector     |
-| `Ctrl+b C-m` | Open multiplex selector |
-| `Ctrl+b C-q` | Demultiplex panes back to separate windows |
+# Reconfigure colors
+sshmx --configure-colors
+
+# Test in tmux
+tmux setw window-style "fg=colour7,bg=colour17"
+```
+
+### Keybindings Don't Work
+
+```bash
+# Reload tmux config
+tmux source-file ~/.tmux.conf
+
+# Check bindings
+tmux list-keys | grep sshmx
+
+# Reinstall
+sshmx --install
+```
+
+### Debug Sessions
+
+```bash
+# Validate JSON
+sshmx --debug
+
+# Check logs
+tail -50 ~/.sshmx/sshmx.log
+```
 
 ---
 
 ## 🤝 Contributing
-Pull requests are welcome!  
-If you find a bug or want a feature, open an [issue](../../issues).
+
+Pull requests are welcome! If you find a bug or want a feature, open an [issue](../../issues).
+
+### Development
+
+```bash
+# Enable debug output
+bash -x sshmx [command]
+
+# Check logs
+tail -f ~/.sshmx/sshmx.log
+```
 
 ---
 
 ## 📜 License
+
 MIT License © 2025 mrbooshehri
+
+---
+
+## 🙏 Acknowledgments
+
+- [tmux](https://github.com/tmux/tmux) - Terminal multiplexer
+- [fzf](https://github.com/junegunn/fzf) - Fuzzy finder
+- [jq](https://github.com/stedolan/jq) - JSON processor
+- [chromaterm](https://github.com/hSaria/Chromaterm) - Color output
+- All contributors and users!
+
+---
+
+## 📊 Changelog
+
+### v2.1
+- ✨ Added user-configurable color mapping system
+- 🎨 Interactive 256-color palette viewer
+- 🔑 Interactive SSH key picker with preview
+- 🚫 Automatic SSH fingerprint acceptance
+- 🐛 Fixed keybinding installation issues
+- 📝 Improved documentation
+
+### v2.0
+- 🚀 Initial release with full feature set
+- 📦 Session management with groups and tags
+- 🔐 GPG password encryption
+- 📊 Statistics and health checks
+- 🎯 Templates and favorites
+- 📤 Multiple export formats
