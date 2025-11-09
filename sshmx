@@ -17,7 +17,6 @@ readonly BACKUP_DIR="$SSHMX_DIR/backups"
 readonly LOG_FILE="$SSHMX_DIR/sshmx.log"
 readonly LOCK_FILE="$SSHMX_DIR/.sessions.lock"
 readonly MAP_FILE="$SSHMX_DIR/sshmx-mapping"
-readonly TMUX_KEYBINDINGS_FILE="$SSHMX_DIR/tmux-keybindings.conf"
 readonly COLOR_MAP_FILE="$SSHMX_DIR/color-map.json"
 readonly SCRIPT_NAME="sshmx"
 readonly SCRIPT_PATH="$(realpath "$0")"
@@ -261,8 +260,25 @@ Testing Colors:
   You can test colors in tmux with:
     tmux setw window-style "fg=colour7,bg=colour17"
 
-Press Enter to continue...
 EOF
+    
+    echo ""
+    info "256 Color Palette Demonstration:"
+    info "================================="
+    echo ""
+    
+    # Display all 256 colors with their numbers
+    for i in {0..255}; do 
+        printf '\e[48;5;%dm%3d ' $i $i
+        (((i+3) % 18)) || printf '\e[0m\n'
+    done
+    printf '\e[0m\n'
+    
+    echo ""
+    info "Note: The number shown is the 'colourN' value for tmux"
+    info "Example: Number 17 = colour17, Number 7 = colour7"
+    echo ""
+    echo "Press Enter to continue..."
     read -r
 }
 
@@ -473,46 +489,6 @@ EOF
 }
 
 # ============================================================================
-# TMUX KEYBINDINGS MANAGEMENT
-# ============================================================================
-
-create_tmux_keybindings() {
-    cat > "$TMUX_KEYBINDINGS_FILE" << 'EOF'
-# sshmx temporary keybindings - auto-generated
-bind-key -n C-M-s display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx"
-bind-key -n C-M-g display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx --groups"
-bind-key -n C-M-m display-popup -E -w 90% -h 80% -d "#{pane_current_path}" "sshmx --multiplex"
-bind-key -n C-M-d run-shell "sshmx --demultiplex"
-bind-key -n C-M-h display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx --history"
-bind-key -n C-M-t display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx --templates"
-bind-key -n C-M-c run-shell "sshmx --check-all"
-EOF
-    log "INFO" "Created temporary tmux keybindings file"
-}
-
-load_tmux_keybindings() {
-    if [[ -n "${TMUX:-}" ]]; then
-        create_tmux_keybindings
-        tmux source-file "$TMUX_KEYBINDINGS_FILE" 2>/dev/null || warn "Could not load tmux keybindings"
-    fi
-}
-
-unload_tmux_keybindings() {
-    if [[ -n "${TMUX:-}" ]] && [[ -f "$TMUX_KEYBINDINGS_FILE" ]]; then
-        # Unbind all keys
-        tmux unbind-key -n C-M-s 2>/dev/null || true
-        tmux unbind-key -n C-M-g 2>/dev/null || true
-        tmux unbind-key -n C-M-m 2>/dev/null || true
-        tmux unbind-key -n C-M-d 2>/dev/null || true
-        tmux unbind-key -n C-M-h 2>/dev/null || true
-        tmux unbind-key -n C-M-t 2>/dev/null || true
-        tmux unbind-key -n C-M-c 2>/dev/null || true
-        rm -f "$TMUX_KEYBINDINGS_FILE"
-        log "INFO" "Unloaded temporary tmux keybindings"
-    fi
-}
-
-# ============================================================================
 # INSTALLATION
 # ============================================================================
 
@@ -534,32 +510,77 @@ setup_permanent_tmux_config() {
         tmux_conf="${tmux_configs[0]}"
         mkdir -p "$(dirname "$tmux_conf")"
         touch "$tmux_conf"
-        info "Created tmux.conf at $tmux_conf"
+        info "Created tmux config: $tmux_conf"
     fi
 
-    # Keybindings to add (using Ctrl+b prefix + key)
-    local bindings=(
-        'bind-key S display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx"'
-        'bind-key G display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx --groups"'
-        'bind-key M display-popup -E -w 90% -h 80% -d "#{pane_current_path}" "sshmx --multiplex"'
-        'bind-key D run-shell "sshmx --demultiplex"'
-        'bind-key H display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx --history"'
+    # === FULL OFFICIAL BINDINGS ===
+    local official_bindings=(
+        'bind-key C-s display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx"'
+        'bind-key C-g display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx --groups"'
+        'bind-key C-m display-popup -E -w 90% -h 80% -d "#{pane_current_path}" "sshmx --multiplex"'
+        'bind-key C-d run-shell "sshmx --demultiplex"'
+        'bind-key C-h display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx --history"'
+        'bind-key C-p display-popup -E -w 90% -h 80% -d "#{pane_current_path}" "sshmx --multiplex"'
+        'bind-key C-q run-shell "sshmx --demultiplex"'
+        'bind-key C-y display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx --history"'
+        'bind-key C-k run-shell "sshmx --check-all"'
     )
 
     local added=0
-    for binding in "${bindings[@]}"; do
-        if ! grep -qF "$binding" "$tmux_conf" 2>/dev/null; then
+    local conflicts=0
+    local conflict_list=""
+
+    info "Checking tmux keybindings in $tmux_conf..."
+
+    for binding in "${official_bindings[@]}"; do
+        local key=$(echo "$binding" | awk '{print $2}')
+        local cmd=$(echo "$binding" | cut -d' ' -f3-)
+
+        # Check if this key is already bound
+        if grep -q "^bind-key.* $key " "$tmux_conf" 2>/dev/null; then
+            local existing=$(grep "^bind-key.* $key " "$tmux_conf" | tail -1)
+            if ! grep -qF "$binding" "$tmux_conf"; then
+                conflicts=$((conflicts + 1))
+                conflict_list="$conflict_list\n  • $key → $existing"
+            fi
+            continue
+        fi
+
+        # Add if not exists
+        if ! grep -qF "$binding" "$tmux_conf"; then
             echo "$binding" >> "$tmux_conf"
             ((added++))
         fi
     done
 
+    # === USER FEEDBACK ===
     if [[ $added -gt 0 ]]; then
-        info "Added $added tmux binding(s) to $tmux_conf"
-        info "Use: prefix+S (sessions), prefix+G (groups), prefix+M (multiplex), prefix+D (demux), prefix+H (history)"
+        info "Added $added sshmx keybinding(s) to $tmux_conf"
     else
-        info "All tmux bindings already exist in $tmux_conf"
+        info "All sshmx keybindings already exist in $tmux_conf"
     fi
+
+    if [[ $conflicts -gt 0 ]]; then
+        warn "Conflicts detected ($conflicts key(s) already in use):"
+        echo -e "$conflict_list" | tail -n +2
+        echo
+        warn "To resolve: Edit $tmux_conf and replace the conflicting bind-key lines."
+        echo "   Or run: tmux unbind-key -n C-s  (etc.)"
+        echo
+    fi
+
+    # Final instructions
+    echo
+    info "Reload tmux config to apply changes:"
+    info "   tmux source-file $tmux_conf"
+    echo
+    info "Permanent shortcuts (Prefix = Ctrl+b):"
+    info "   C-s : Session selector"
+    info "   C-g : Group selector"
+    info "   C-m : Multiplex"
+    info "   C-d : Demultiplex"
+    info "   C-k : Check all hosts"
+    echo
 }
 
 install_script() {
@@ -2389,6 +2410,8 @@ connect_multiple() {
 # HELP
 # ============================================================================
 # Function to generate bash completion script
+
+# Function to generate bash completion script
 generate_completion() {
     cat << 'EOF'
 # sshmx bash completion
@@ -2401,10 +2424,11 @@ _sshmx() {
     # All options
     opts="--install --add --edit --remove --clone --sync --groups --tags --export 
           --import --multiplex --demultiplex --history --templates --add-template 
-          --use-template --check --check-all --favorites --add-favorite --bulk-edit 
-          --export-config --completion --help --search --quick --add-note --view-notes 
-          --delete-note --stats --list-groups --export-ansible 
-          --export-csv --validate-config -i -a -e -r -s -g -m -d -h -q"
+          --use-template --list-templates --check --check-all --favorites --add-favorite 
+          --bulk-edit --export-config --export-ansible --export-csv --validate-config
+          --configure-colors --completion --help --search --quick --add-note --view-notes 
+          --delete-note --stats --list-groups --debug --retry --batch
+          -i -a -e -r -s -g -m -d -h -q"
     
     # If previous word is a flag that takes arguments
     case "${prev}" in
@@ -2572,10 +2596,6 @@ main() {
     check_dependencies || exit 1
     initialize_data_files
     auto_backup
-    
-    # Load temporary tmux keybindings
-    load_tmux_keybindings
-    trap unload_tmux_keybindings EXIT
     
     local selected=""
     
