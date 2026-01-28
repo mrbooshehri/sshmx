@@ -2597,6 +2597,14 @@ main() {
     initialize_data_files
     auto_backup
     
+    # If not inside tmux and no args, attach to existing sshmx session if it exists
+    if [[ -z "${TMUX:-}" ]] && [[ -z "${1:-}" ]]; then
+        if tmux has-session -t "$DEFAULT_SESSION" 2>/dev/null; then
+            info "Found existing tmux session '$DEFAULT_SESSION'. Attaching..."
+            exec tmux attach-session -t "$DEFAULT_SESSION"
+        fi
+    fi
+
     local selected=""
     
     # Parse arguments
