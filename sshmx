@@ -396,6 +396,60 @@ check_dependencies() {
     return 0
 }
 
+# ============================================================================
+# CLIPBOARD PASTE (CRLF-SAFE)
+# ============================================================================
+
+get_clipboard_content() {
+    local content=""
+
+    if command -v xclip &>/dev/null && [[ -n "${DISPLAY:-}" ]]; then
+        content=$(xclip -selection clipboard -o 2>/dev/null)
+    elif command -v xsel &>/dev/null && [[ -n "${DISPLAY:-}" ]]; then
+        content=$(xsel --clipboard --output 2>/dev/null)
+    elif command -v wl-paste &>/dev/null && [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+        content=$(wl-paste -n 2>/dev/null)
+    elif command -v pbpaste &>/dev/null; then
+        content=$(pbpaste 2>/dev/null)
+    elif command -v powershell.exe &>/dev/null; then
+        # WSL fallback: pull from the Windows clipboard
+        content=$(powershell.exe -NoProfile -Command "Get-Clipboard" 2>/dev/null)
+    else
+        return 1
+    fi
+
+    printf '%s' "$content"
+}
+
+# Paste clipboard into the active tmux pane, stripping CRLF/^M/BOM/NUL junk
+paste_clean() {
+    local raw
+    if ! raw=$(get_clipboard_content) || [[ -z "$raw" ]]; then
+        if [[ -n "${TMUX:-}" ]]; then
+            tmux display-message "sshmx: clipboard empty or no clipboard tool found (install xclip/wl-clipboard)"
+        else
+            error "Clipboard empty or no clipboard tool found (install xclip/wl-clipboard)"
+        fi
+        return 1
+    fi
+
+    # CRLF -> LF (and stray ^M), strip UTF-8 BOM, strip NUL bytes
+    local clean
+    clean=$(printf '%s' "$raw" \
+        | tr -d '\r' \
+        | sed '1s/^\xef\xbb\xbf//' \
+        | tr -d '\000')
+
+    if [[ -z "${TMUX:-}" ]]; then
+        printf '%s' "$clean"
+        return 0
+    fi
+
+    printf '%s' "$clean" | tmux load-buffer -b sshmx_paste_clean -
+    tmux paste-buffer -b sshmx_paste_clean -d
+    log "INFO" "Pasted CRLF-cleaned clipboard content into tmux pane"
+}
+
 # File locking for concurrent access protection
 acquire_lock() {
     local timeout="${1:-10}"
@@ -524,6 +578,7 @@ setup_permanent_tmux_config() {
         'bind-key C-q run-shell "sshmx --demultiplex"'
         'bind-key C-y display-popup -E -w 70% -h 80% -d "#{pane_current_path}" "sshmx --history"'
         'bind-key C-k run-shell "sshmx --check-all"'
+        'bind-key C-v run-shell "sshmx --paste-clean"'
     )
 
     local added=0
@@ -580,6 +635,7 @@ setup_permanent_tmux_config() {
     info "   C-m : Multiplex"
     info "   C-d : Demultiplex"
     info "   C-k : Check all hosts"
+    info "   C-v : Paste clipboard (CRLF-clean)"
     echo
 }
 
@@ -2423,12 +2479,12 @@ _sshmx() {
     
     # All options
     opts="--install --add --edit --remove --clone --sync --groups --tags --export 
-          --import --multiplex --demultiplex --history --templates --add-template 
+          --import --multiplex --demultiplex --history --paste-clean --templates --add-template 
           --use-template --list-templates --check --check-all --favorites --add-favorite 
           --bulk-edit --export-config --export-ansible --export-csv --validate-config
           --configure-colors --completion --help --search --quick --add-note --view-notes 
           --delete-note --stats --list-groups --debug --retry --batch
-          -i -a -e -r -s -g -m -d -h -q"
+          -i -a -e -r -s -g -m -d -h -q -x"
     
     # If previous word is a flag that takes arguments
     case "${prev}" in
@@ -2541,6 +2597,7 @@ Permanent Tmux Bindings (after installation):
     prefix+M                Multiplex windows
     prefix+D                Demultiplex
     prefix+H                Connection history
+    prefix+V                Paste clipboard (CRLF-clean)
 
 Session Storage:
     ~/.sshmx/sessions.json      Session configurations
@@ -2722,6 +2779,10 @@ main() {
         --quick|-q)
             selected=$(quick_jump)
             ;;
+        --paste-clean|-x)
+                    paste_clean
+                    exit 0
+                    ;;
         --clone)
             clone_session
             exit 0
